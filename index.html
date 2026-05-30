@@ -458,6 +458,7 @@ function handlePointCloud(msg) {
 
   // Update geometry
   pcGeom.setFromPoints(pcAccum);
+  pcGeom.computeBoundingSphere();
   document.getElementById('pc-count').textContent = pcAccum.length;
 }
 

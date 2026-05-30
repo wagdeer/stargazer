@@ -39,18 +39,12 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { ColladaLoader } from 'three/addons/loaders/ColladaLoader.js';
 
-// ── URDF Loader (chained from CDN) ──
+// ── URDF Loader (CDN) ──
 let URDFLoader;
 try {
-  const urdfModule = await import('https://cdn.jsdelivr.net/npm/urdf-loader@0.13.0/src/URDFLoader.min.js');
-  URDFLoader = urdfModule.default;
+  URDFLoader = (await import('https://cdn.jsdelivr.net/npm/urdf-loader@0.1.0/URDFLoader.js')).default;
 } catch(e) {
-  // Dynamic import fallback
-  const resp = await fetch('https://cdn.jsdelivr.net/npm/urdf-loader@0.13.0/src/URDFLoader.min.js');
-  const code = await resp.text();
-  const blob = new Blob([code], {type:'text/javascript'});
-  const url = URL.createObjectURL(blob);
-  URDFLoader = (await import(url)).default;
+  console.error('URDFLoader load failed:', e);
 }
 
 // ── Scene Setup ──
@@ -113,7 +107,6 @@ const walkSpeed = 8; // rad/s
 
 // Load Go1 URDF
 const loader = new URDFLoader();
-loader.packages = { 'go1_description': './models/go1' };
 loader.loadMeshCb = (path, manager, done) => {
   new ColladaLoader(manager).load(path, (collada) => done(collada.scene), null, () => done(null));
 };

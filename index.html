@@ -17,7 +17,6 @@
   }
   #hud .green { color: #4f4; }
   #hud .red { color: #f44; }
-  #hud .yellow { color: #fc4; }
 </style>
 </head>
 <body>
@@ -38,6 +37,7 @@
 <script type="module">
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 
 // ── Scene Setup ──
 const scene = new THREE.Scene();
@@ -57,179 +57,177 @@ const controls = new OrbitControls(camera, renderer.domElement);
 controls.target.set(0, 0, 0);
 controls.update();
 
-// ── Lights ──
 scene.add(new THREE.AmbientLight(0x333344, 3));
 const dirLight = new THREE.DirectionalLight(0xffffff, 2);
 dirLight.position.set(10, 20, 10);
 scene.add(dirLight);
 
-// ── Grid ──
 const grid = new THREE.GridHelper(40, 40, 0x222233, 0x111122);
 scene.add(grid);
 
-// ── Axis ──
 const axisLen = 2;
-const axisRed   = new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0,0,0), new THREE.Vector3(axisLen,0,0)]), new THREE.LineBasicMaterial({color:0xff3333}));
-const axisGreen = new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0,0,0), new THREE.Vector3(0,axisLen,0)]), new THREE.LineBasicMaterial({color:0x33ff33}));
-const axisBlue  = new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0,0,0), new THREE.Vector3(0,0,axisLen)]), new THREE.LineBasicMaterial({color:0x3366ff}));
-scene.add(axisRed, axisGreen, axisBlue);
+scene.add(new THREE.Line(
+  new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0,0,0), new THREE.Vector3(axisLen,0,0)]),
+  new THREE.LineBasicMaterial({color:0xff3333})));
+scene.add(new THREE.Line(
+  new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0,0,0), new THREE.Vector3(0,axisLen,0)]),
+  new THREE.LineBasicMaterial({color:0x33ff33})));
+scene.add(new THREE.Line(
+  new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0,0,0), new THREE.Vector3(0,0,axisLen)]),
+  new THREE.LineBasicMaterial({color:0x3366ff})));
 
-// ── Trajectory ──
 const trajPoints = [];
 const trajGeom = new THREE.BufferGeometry();
-const trajMat = new THREE.PointsMaterial({ color: 0x44ff88, size: 0.08 });
-const trajCloud = new THREE.Points(trajGeom, trajMat);
+const trajCloud = new THREE.Points(trajGeom, new THREE.PointsMaterial({ color: 0x44ff88, size: 0.08 }));
 scene.add(trajCloud);
-
 const trajLineGeom = new THREE.BufferGeometry();
 const trajLine = new THREE.Line(trajLineGeom, new THREE.LineBasicMaterial({ color: 0x44ff88, transparent:true, opacity:0.4 }));
 scene.add(trajLine);
 
-// ── Point Cloud ──
 const pcGeom = new THREE.BufferGeometry();
-const pcMat = new THREE.PointsMaterial({ color: 0xffaa44, size: 0.04, sizeAttenuation: true });
-const pcCloud = new THREE.Points(pcGeom, pcMat);
+const pcCloud = new THREE.Points(pcGeom, new THREE.PointsMaterial({ color: 0xffaa44, size: 0.04, sizeAttenuation: true }));
 scene.add(pcCloud);
 
-// ── Robot Model (simple box) ──
-const robotGeom = new THREE.BoxGeometry(0.3, 0.2, 0.4);
-const robotMat = new THREE.MeshStandardMaterial({ color: 0x44aaff, metalness: 0.3, roughness: 0.6 });
-const robotMesh = new THREE.Mesh(robotGeom, robotMat);
-scene.add(robotMesh);
-const robotArrow = new THREE.ArrowHelper(new THREE.Vector3(1,0,0), new THREE.Vector3(0,0,0), 0.6, 0x44aaff);
-scene.add(robotArrow);
+// ── Robot GLTF Model ──
+const robotRoot = new THREE.Group();
+scene.add(robotRoot);
+let legJoints = {}; // joint_name -> THREE.Object3D
+
+const gltfLoader = new GLTFLoader();
+gltfLoader.load('./models/go1/go1.glb', (gltf) => {
+  const model = gltf.scene;
+  model.scale.set(0.5, 0.5, 0.5);
+  robotRoot.add(model);
+  
+  // Find leg joints by name in the GLTF hierarchy
+  const jointNames = [
+    'FR_hip', 'FR_thigh', 'FR_calf',
+    'FL_hip', 'FL_thigh', 'FL_calf',
+    'RR_hip', 'RR_thigh', 'RR_calf',
+    'RL_hip', 'RL_thigh', 'RL_calf',
+  ];
+  model.traverse((node) => {
+    if (jointNames.includes(node.name)) {
+      legJoints[node.name] = node;
+    }
+  });
+  const found = Object.keys(legJoints).length;
+  document.getElementById('status').textContent = 
+    `● Go1 模型已加载 (${found}/12 joints)`;
+  if (found === 0) console.warn('No leg joints found — check GLTF node names');
+}, null, (err) => {
+  console.error('GLTF load failed:', err);
+  document.getElementById('status').textContent = '● 模型加载失败';
+});
+
+// ── Walking animation ──
+let walkPhase = 0;
+const walkSpeed = 8;
+
+function animateLegs(dt) {
+  if (Object.keys(legJoints).length < 4) return;
+  walkPhase += walkSpeed * dt;
+  const p = walkPhase;
+
+  const legs = [
+    { hip: 'FR_hip', thigh: 'FR_thigh', calf: 'FR_calf', phase: 0 },
+    { hip: 'FL_hip', thigh: 'FL_thigh', calf: 'FL_calf', phase: Math.PI },
+    { hip: 'RR_hip', thigh: 'RR_thigh', calf: 'RR_calf', phase: Math.PI },
+    { hip: 'RL_hip', thigh: 'RL_thigh', calf: 'RL_calf', phase: 0 },
+  ];
+
+  for (const leg of legs) {
+    const lp = p + leg.phase;
+    const h = legJoints[leg.hip];
+    const t = legJoints[leg.thigh];
+    const c = legJoints[leg.calf];
+    if (h) { h.rotation.set(0, 0, 0); h.rotateX(0.5 * Math.cos(lp)); }
+    if (t) { t.rotation.set(0, 0, 0); t.rotateX(0.6 * Math.sin(lp)); }
+    if (c) { c.rotation.set(0, 0, 0); c.rotateX(-0.4 * Math.sin(lp)); }
+  }
+}
 
 // ── Render Loop ──
+let lastTime = performance.now();
 function animate() {
   requestAnimationFrame(animate);
+  const dt = (performance.now() - lastTime) / 1000;
+  lastTime = performance.now();
+  animateLegs(dt);
   controls.update();
   renderer.render(scene, camera);
 }
 animate();
 
-// ── HUD elements ──
+// ── HUD ──
 const statusEl = document.getElementById('status');
 const trajCountEl = document.getElementById('traj-count');
 const pcCountEl = document.getElementById('pc-count');
 
 // ── ROS Bridge ──
 const wsUrl = `ws://${window.location.host}/ws`;
-let rosConnected = false;
-
 function connect() {
   const ws = new WebSocket(wsUrl);
-  
   ws.onopen = () => {
-    rosConnected = true;
-    statusEl.textContent = '● 已连接';
     statusEl.className = 'green';
-    
-    // Subscribe to odometry
-    ws.send(JSON.stringify({
-      op: 'subscribe', topic: '/dlio/odom_node/odom', type: 'nav_msgs/msg/Odometry'
-    }));
-    // Subscribe to deskewed point cloud
-    ws.send(JSON.stringify({
-      op: 'subscribe', topic: '/dlio/odom_node/pointcloud/deskewed', type: 'sensor_msgs/msg/PointCloud2'
-    }));
+    ws.send(JSON.stringify({ op: 'subscribe', topic: '/dlio/odom_node/odom', type: 'nav_msgs/msg/Odometry' }));
+    ws.send(JSON.stringify({ op: 'subscribe', topic: '/dlio/odom_node/pointcloud/deskewed', type: 'sensor_msgs/msg/PointCloud2' }));
   };
-
   ws.onmessage = (event) => {
     const msg = JSON.parse(event.data);
-    if (msg.op === 'publish') {
-      if (msg.topic === '/dlio/odom_node/odom') {
-        handleOdometry(msg.msg);
-      } else if (msg.topic === '/dlio/odom_node/pointcloud/deskewed') {
-        handlePointCloud(msg.msg);
-      }
-    }
+    if (msg.op !== 'publish') return;
+    if (msg.topic === '/dlio/odom_node/odom') handleOdometry(msg.msg);
+    else if (msg.topic === '/dlio/odom_node/pointcloud/deskewed') handlePointCloud(msg.msg);
   };
-
-  ws.onclose = () => {
-    rosConnected = false;
-    statusEl.textContent = '● 断开，3秒后重连...';
-    statusEl.className = 'red';
-    setTimeout(connect, 3000);
-  };
-
-  ws.onerror = () => {
-    statusEl.textContent = '● 连接失败';
-    statusEl.className = 'red';
-  };
+  ws.onclose = () => { statusEl.textContent = '● 断开，3秒后重连...'; statusEl.className = 'red'; setTimeout(connect, 3000); };
+  ws.onerror = () => { statusEl.textContent = '● 连接失败'; statusEl.className = 'red'; };
 }
 
-// ── Coordinate conversion: ROS (X-fwd Y-left Z-up) → three.js (X-right Y-up Z-fwd) ──
-function rosToThree(x, y, z) {
-  return new THREE.Vector3(x, z, -y);
-}
+function rosToThree(x, y, z) { return new THREE.Vector3(x, z, -y); }
 
-// ── Odometry Handler ──
 function handleOdometry(msg) {
   const p = msg.pose.pose.position;
   const pos = rosToThree(p.x, p.y, p.z);
   trajPoints.push(pos);
-  
-  // Limit trajectory size
   if (trajPoints.length > 10000) trajPoints.shift();
-  
   trajGeom.setFromPoints(trajPoints);
   trajLineGeom.setFromPoints(trajPoints);
   trajCountEl.textContent = trajPoints.length;
-  
-  // Move robot model
+
   const q = msg.pose.pose.orientation;
-  // ROS quaternion (w,x,y,z) with ROS axes → rotate to three.js frame
   const rosQ = new THREE.Quaternion(q.x, q.y, q.z, q.w);
-  // Rotate from ROS frame to three.js: X→X, Y→-Z, Z→Y
   const rot = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1,0,0), -Math.PI/2);
-  robotMesh.position.copy(pos);
-  robotMesh.quaternion.copy(rot).multiply(rosQ);
-  robotArrow.position.copy(pos);
-  const dir = new THREE.Vector3(1, 0, 0).applyQuaternion(robotMesh.quaternion);
-  robotArrow.setDirection(dir);
+  robotRoot.position.copy(pos);
+  robotRoot.quaternion.copy(rot).multiply(rosQ);
 }
 
-// ── Point Cloud Handler ──
 function handlePointCloud(msg) {
   if (!msg.data || msg.width === 0) return;
-  
-  // Decode base64 → binary
   const raw = atob(msg.data);
   const bytes = new Uint8Array(raw.length);
   for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
-  
-  // Find x,y,z field offsets
   let ox = 0, oy = 0, oz = 0;
   for (const f of msg.fields) {
     if (f.name === 'x') ox = f.offset;
     if (f.name === 'y') oy = f.offset;
     if (f.name === 'z') oz = f.offset;
   }
-  
   const view = new DataView(bytes.buffer);
-  const pointStep = msg.point_step;
-  const points = [];
-  
+  const pts = [];
   for (let i = 0; i < msg.width; i++) {
-    const off = i * pointStep;
-    const rx = view.getFloat32(off + ox, true);
-    const ry = view.getFloat32(off + oy, true);
-    const rz = view.getFloat32(off + oz, true);
-    points.push(rosToThree(rx, ry, rz));
+    const off = i * msg.point_step;
+    pts.push(rosToThree(view.getFloat32(off+ox,true), view.getFloat32(off+oy,true), view.getFloat32(off+oz,true)));
   }
-  
-  pcGeom.setFromPoints(points);
-  pcCountEl.textContent = points.length;
+  pcGeom.setFromPoints(pts);
+  pcCountEl.textContent = pts.length;
 }
 
-// ── Window Resize ──
 window.addEventListener('resize', () => {
   camera.aspect = window.innerWidth / window.innerHeight;
   camera.updateProjectionMatrix();
   renderer.setSize(window.innerWidth, window.innerHeight);
 });
 
-// ── Start ──
 connect();
 </script>
 </body>

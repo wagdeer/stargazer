@@ -209,11 +209,11 @@ const GaitEngine = {
     RR: 0.5, RL: 0.0,
   },
 
-  // Front legs: thigh forward (+), rear legs: thigh backward (-)
-  // For IK, we negate fx target for front legs to get the mirrored solution
-  mirrors: {
-    FR: -1, FL: -1,   // front: flip fx → thigh positive
-    RR:  1, RL:  1,   // rear:  keep  → thigh negative
+  // Front legs mirror: negate IK result (thigh forward, foot mirrored in X)
+  // All legs share the same foot trajectory (ahead→behind during stance)
+  isFront: {
+    FR: true, FL: true,
+    RR: false, RL: false,
   },
 
   update(dt, vx) {
@@ -241,16 +241,15 @@ const GaitEngine = {
   footTarget(leg) {
     let phase = (this.phase[leg] + this.offsets[leg]) % 1;
     const sl = this.stepLength;
-    const mirror = this.mirrors[leg];
 
     let fx, fz;
     if (phase < this.stanceRatio) {
       const s = phase / this.stanceRatio;
-      fx = mirror * sl * (0.5 - s);     // +sl/2 → -sl/2 (mirrored for front)
+      fx = sl * (0.5 - s);     // +sl/2 → -sl/2 (ahead→behind)
       fz = this.standHeight;
     } else {
       const s = (phase - this.stanceRatio) / (1 - this.stanceRatio);
-      fx = mirror * (-sl * 0.5 + sl * s); // -sl/2 → +sl/2
+      fx = -sl * 0.5 + sl * s; // -sl/2 → +sl/2 (behind→ahead, swing forward)
       fz = this.standHeight + this.liftHeight * Math.sin(Math.PI * s);
     }
     return { fx, fz };
@@ -260,26 +259,35 @@ const GaitEngine = {
     const result = {};
     const blend = this.standBlend;
 
-    // Standing foot targets: front legs slightly ahead, rear slightly behind
-    const standFX = { FR: -0.03, FL: -0.03, RR: 0.03, RL: 0.03 };
+    // Standing foot targets: all legs same (rear posture: foot ahead of hip)
+    // Front legs negate IK to get mirrored posture (foot behind hip, thigh forward)
+    const standFX = 0.03;
     const standFZ = -0.24;
+    const ikStand = solveLegIK(standFX, standFZ);
 
     for (const leg of ['FR', 'FL', 'RR', 'RL']) {
       const { fx, fz } = this.footTarget(leg);
-      const ikWalk = solveLegIK(fx, fz);
+      let { thigh, calf } = solveLegIK(fx, fz);
+      let standThigh = ikStand.thigh;
+      let standCalf = ikStand.calf;
 
-      // Standing pose via IK at stand target
-      const ikStand = solveLegIK(standFX[leg], standFZ);
+      // Front legs: negate both angles → mirrored posture (thigh forward)
+      if (this.isFront[leg]) {
+        thigh = -thigh;
+        calf = -calf;
+        standThigh = -standThigh;
+        standCalf = -standCalf;
+      }
 
       // Blend walking ↔ standing
-      const thigh = ikWalk.thigh * (1 - blend) + ikStand.thigh * blend;
-      const calf  = ikWalk.calf  * (1 - blend) + ikStand.calf  * blend;
+      const t = thigh * (1 - blend) + standThigh * blend;
+      const c = calf  * (1 - blend) + standCalf  * blend;
 
       // Hip abduction: small lateral oscillation
       const hipPhase = (this.phase[leg] + this.offsets[leg]) % 1;
       const hip = 0.06 * Math.sin(hipPhase * Math.PI * 2) * (1 - blend);
 
-      result[leg] = { hip, thigh, calf };
+      result[leg] = { hip, thigh: t, calf: c };
     }
     return result;
   },

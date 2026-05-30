@@ -142,172 +142,142 @@ loader.load(
 );
 
 // ═══════════════════════════════════════════════════════
-// Leg IK — 2-DOF planar solver (thigh + calf, both Y-axis)
+// Leg IK — correct 2-DOF solver for three.js GLTF chain
+//
+// three.js transform chain per leg:
+//   thigh node: translate(0, -0.08, 0), rotate_y(θ1)
+//   calf  node: translate(0, 0, -0.213), rotate_y(θ2)
+//   foot  tip:  (0, 0, -0.24) in calf local
+//
+// FK: fx = -L2*sin(θ1+θ2) - L1z*sin(θ1)
+//     fz = -L2*cos(θ1+θ2) - L1z*cos(θ1)
 // ═══════════════════════════════════════════════════════
-const LEG = {
-  L1: 0.08,    // thigh segment (hip→knee), meters
-  L2: 0.25,    // calf segment (knee→foot), meters
+const L1z = 0.213;   // calf joint Z-offset from thigh frame
+const L2  = 0.24;    // calf mesh visual length (hip→foot ≈ 0.29m total)
 
-  // Standing pose joint angles (radians)
-  stand: {
-    thigh: 0.35,
-    calf: -2.0,
-  },
+function solveLegIK(fx, fz) {
+  // Solve for θ1 (thigh), θ2 (calf)
+  const denom = Math.sqrt(fx * fx + fz * fz);
+  const K = (L1z * L1z - fx * fx - fz * fz - L2 * L2) / (2 * L2);
 
-  // Joint limits from URDF
-  limits: {
-    thigh: [-0.686, 4.501],
-    calf: [-2.818, -0.888],
-  },
+  let S; // θ1 + θ2
+  if (denom < 1e-10) {
+    S = Math.PI;
+  } else {
+    const phi = Math.atan2(fz, fx);
+    let ratio = K / denom;
+    ratio = Math.max(-1, Math.min(1, ratio));
+    S = Math.asin(ratio) - phi;
+  }
 
-  /**
-   * Solve 2-DOF planar IK.
-   * @param {number} fx - target X in hip frame (forward, ROS)
-   * @param {number} fz - target Z in hip frame (up, ROS)
-   * @returns {{thigh: number, calf: number}} joint angles in radians
-   */
-  solve(fx, fz) {
-    const { L1, L2 } = this;
-    const d2 = fx * fx + fz * fz;
-    const d = Math.sqrt(Math.max(d2, 1e-8));
+  const sinT1 = -(fx + L2 * Math.sin(S)) / L1z;
+  const cosT1 = -(fz + L2 * Math.cos(S)) / L1z;
+  let thigh = Math.atan2(sinT1, cosT1);
+  let calf = S - thigh;
 
-    // Clamp reach
-    const dClamp = Math.min(Math.max(d, Math.abs(L1 - L2) + 0.001), L1 + L2 - 0.001);
+  // Normalize
+  while (calf > Math.PI) calf -= 2 * Math.PI;
+  while (calf < -Math.PI) calf += 2 * Math.PI;
 
-    // cos(θ2) from law of cosines
-    let cos2 = (dClamp * dClamp - L1 * L1 - L2 * L2) / (2 * L1 * L2);
-    cos2 = Math.max(-1, Math.min(1, cos2));
-
-    // Calf always bent backward (negative angle)
-    const calf = -Math.acos(cos2);
-
-    // θ1 = atan2(fz_down, fx) - atan2(L2·sin(θ2), L1 + L2·cos(θ2))
-    // fz_down = -fz  (positive = downward from hip)
-    const thigh = Math.atan2(-fz, fx) - Math.atan2(L2 * Math.sin(calf), L1 + L2 * Math.cos(calf));
-
-    // Clamp to joint limits
-    return {
-      thigh: Math.max(this.limits.thigh[0], Math.min(this.limits.thigh[1], thigh)),
-      calf: Math.max(this.limits.calf[0], Math.min(this.limits.calf[1], calf)),
-    };
-  },
-
-  /**
-   * Forward kinematics. @returns {{fx: number, fz: number}}
-   */
-  fk(thigh, calf) {
-    const fx = this.L1 * Math.sin(thigh) + this.L2 * Math.sin(thigh + calf);
-    const fz = -(this.L1 * Math.cos(thigh) + this.L2 * Math.cos(thigh + calf));
-    return { fx, fz };
-  },
-};
+  return { thigh, calf };
+}
 
 
 // ═══════════════════════════════════════════════════════
 // Gait Engine — velocity-driven foot trajectory + IK
 // ═══════════════════════════════════════════════════════
 const GaitEngine = {
-  phase: { FR: 0, FL: 0, RR: 0, RL: 0 },  // per-leg gait phase [0, 1)
-  speed: 0,        // current robot speed (m/s)
-  stepLength: 0.08, // current step length (m)
+  phase: { FR: 0, FL: 0, RR: 0, RL: 0 },
+  speed: 0,
+  stepLength: 0.06,
 
-  // Parameters
-  baseStepLength: 0.04,   // step at minimum speed
-  maxStepLength: 0.14,    // step at max speed
-  stanceRatio: 0.55,      // fraction of cycle in stance
-  liftHeight: 0.06,       // foot lift during swing (m)
-  standHeight: -0.28,     // nominal foot Z when standing
-  speedGain: 2.5,         // speed → phase rate multiplier
-  deadband: 0.02,         // below this speed, stand still
-  bodySwayAmp: 0.015,     // body lateral sway (m)
+  // Tunable parameters
+  baseStepLength: 0.04,
+  maxStepLength: 0.10,
+  stanceRatio: 0.55,
+  liftHeight: 0.05,
+  standHeight: -0.24,    // foot Z in hip frame at standing
+  speedGain: 2.5,
+  deadband: 0.02,
+  blendRate: 5.0,
 
-  // Trot gait: diagonal pairs have same phase offset
+  standBlend: 1.0,       // start in standing pose
+
+  // Trot gait: diagonal pairs in phase
   offsets: {
     FR: 0.0, FL: 0.5,
     RR: 0.5, RL: 0.0,
   },
 
-  // Blend factor toward standing pose (0 = walking, 1 = standing)
-  standBlend: 0,
+  // Front legs: thigh forward (+), rear legs: thigh backward (-)
+  // For IK, we negate fx target for front legs to get the mirrored solution
+  mirrors: {
+    FR: -1, FL: -1,   // front: flip fx → thigh positive
+    RR:  1, RL:  1,   // rear:  keep  → thigh negative
+  },
 
-  /**
-   * Update gait state.
-   * @param {number} dt - delta time (seconds)
-   * @param {number} vx - robot forward velocity (m/s, ROS X)
-   */
   update(dt, vx) {
     const absV = Math.abs(vx);
 
-    // Transition to standing if slow
     if (absV < this.deadband) {
-      this.standBlend = Math.min(1, this.standBlend + dt * 4);
-      // Still tick phase slowly so legs return smoothly when moving again
-      for (const leg of ['FR','FL','RR','RL']) {
+      this.standBlend = Math.min(1, this.standBlend + dt * this.blendRate);
+      for (const leg of ['FR','FL','RR','RL'])
         this.phase[leg] = (this.phase[leg] + dt * 0.3) % 1;
-      }
       this.speed = 0;
       this.stepLength = this.baseStepLength;
       return;
     }
 
-    // Walking: advance phase proportional to speed
-    this.standBlend = Math.max(0, this.standBlend - dt * 4);
+    this.standBlend = Math.max(0, this.standBlend - dt * this.blendRate);
     this.speed = absV;
-    this.stepLength = this.baseStepLength + (this.maxStepLength - this.baseStepLength) * Math.min(absV / 1.5, 1.0);
+    this.stepLength = this.baseStepLength
+      + (this.maxStepLength - this.baseStepLength) * Math.min(absV / 1.5, 1.0);
 
     const phaseRate = absV * this.speedGain;
-    for (const leg of ['FR','FL','RR','RL']) {
+    for (const leg of ['FR','FL','RR','RL'])
       this.phase[leg] = (this.phase[leg] + dt * phaseRate) % 1;
-    }
   },
 
-  /**
-   * Get desired foot position in hip frame for one leg.
-   * @param {string} leg - 'FR', 'FL', 'RR', 'RL'
-   * @returns {{fx: number, fz: number}}
-   */
   footTarget(leg) {
     let phase = (this.phase[leg] + this.offsets[leg]) % 1;
     const sl = this.stepLength;
+    const mirror = this.mirrors[leg];
 
     let fx, fz;
     if (phase < this.stanceRatio) {
-      // Stance: foot on ground, push backward
       const s = phase / this.stanceRatio;
-      fx = sl * (0.5 - s);        // +sl/2 → -sl/2
+      fx = mirror * sl * (0.5 - s);     // +sl/2 → -sl/2 (mirrored for front)
       fz = this.standHeight;
     } else {
-      // Swing: foot lifts, swings forward
       const s = (phase - this.stanceRatio) / (1 - this.stanceRatio);
-      fx = -sl * 0.5 + sl * s;    // -sl/2 → +sl/2
+      fx = mirror * (-sl * 0.5 + sl * s); // -sl/2 → +sl/2
       fz = this.standHeight + this.liftHeight * Math.sin(Math.PI * s);
     }
-
     return { fx, fz };
   },
 
-  /**
-   * Compute joint angles for all legs.
-   * @returns {Object} leg→{hip, thigh, calf} in radians
-   */
   computeJoints() {
     const result = {};
-    const { stand } = LEG;
+    const blend = this.standBlend;
+
+    // Standing foot targets: front legs slightly ahead, rear slightly behind
+    const standFX = { FR: -0.03, FL: -0.03, RR: 0.03, RL: 0.03 };
+    const standFZ = -0.24;
 
     for (const leg of ['FR', 'FL', 'RR', 'RL']) {
-      // Walking target
       const { fx, fz } = this.footTarget(leg);
-      const ikWalk = LEG.solve(fx, fz);
+      const ikWalk = solveLegIK(fx, fz);
 
-      // Blend toward standing
-      const blend = this.standBlend;
-      const thigh = ikWalk.thigh * (1 - blend) + stand.thigh * blend;
-      const calf = ikWalk.calf * (1 - blend) + stand.calf * blend;
+      // Standing pose via IK at stand target
+      const ikStand = solveLegIK(standFX[leg], standFZ);
 
-      // Hip abduction: small oscillation for balance
+      // Blend walking ↔ standing
+      const thigh = ikWalk.thigh * (1 - blend) + ikStand.thigh * blend;
+      const calf  = ikWalk.calf  * (1 - blend) + ikStand.calf  * blend;
+
+      // Hip abduction: small lateral oscillation
       const hipPhase = (this.phase[leg] + this.offsets[leg]) % 1;
-      const hipWalk = 0.08 * Math.sin(hipPhase * Math.PI * 2);  // small lateral
-      const hip = hipWalk * (1 - blend);
+      const hip = 0.06 * Math.sin(hipPhase * Math.PI * 2) * (1 - blend);
 
       result[leg] = { hip, thigh, calf };
     }

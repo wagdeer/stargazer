@@ -6,18 +6,18 @@
 <title>stargazer — realtime robot 3D viewer</title>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
-  body { background: #0a0a0f; overflow: hidden; font-family: 'Segoe UI', sans-serif; }
+  body { background: #f2e8db; overflow: hidden; font-family: 'Segoe UI', sans-serif; }
   canvas { display: block; }
   #hud {
     position: fixed; top: 12px; left: 12px;
-    color: #888; font-size: 13px;
-    background: rgba(10,10,15,0.85);
+    color: #6b5e53; font-size: 13px;
+    background: rgba(255,252,247,0.85);
     padding: 8px 14px; border-radius: 6px;
-    border: 1px solid #222;
+    border: 1px solid #d8cfc2;
   }
-  #hud .green { color: #4f4; }
-  #hud .red { color: #f44; }
-  #hud .yellow { color: #fc4; }
+  #hud .green { color: #5a8a4a; }
+  #hud .red { color: #b8553a; }
+  #hud .yellow { color: #b8853a; }
 </style>
 </head>
 <body>
@@ -45,8 +45,8 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 // Scene Setup
 // ═══════════════════════════════════════════════════════
 const scene = new THREE.Scene();
-scene.background = new THREE.Color(0x0a0a0f);
-scene.fog = new THREE.Fog(0x0a0a0f, 20, 100);
+scene.background = new THREE.Color(0xf2e8db);
+scene.fog = new THREE.Fog(0xf2e8db, 40, 120);
 
 const camera = new THREE.PerspectiveCamera(55, window.innerWidth/window.innerHeight, 0.1, 500);
 camera.position.set(5, 4, 8);
@@ -63,24 +63,24 @@ controls.target.set(0, 0, 0.5);
 controls.update();
 
 // Lights
-scene.add(new THREE.AmbientLight(0x404060, 4));
+scene.add(new THREE.AmbientLight(0xffffff, 5));
 const dirLight = new THREE.DirectionalLight(0xffffff, 3);
 dirLight.position.set(10, 20, 10);
 dirLight.castShadow = true;
 scene.add(dirLight);
-const fillLight = new THREE.DirectionalLight(0x8899cc, 1.5);
+const fillLight = new THREE.DirectionalLight(0x8899cc, 1);
 fillLight.position.set(-5, 2, -5);
 scene.add(fillLight);
 
 // Grid
-const grid = new THREE.GridHelper(40, 40, 0x222233, 0x111122);
+const grid = new THREE.GridHelper(40, 40, 0xddd4c6, 0xece4d8);
 scene.add(grid);
 
 // Axis
 const axisLen = 2;
-const matR = new THREE.LineBasicMaterial({color: 0xff3333});
-const matG = new THREE.LineBasicMaterial({color: 0x33ff33});
-const matB = new THREE.LineBasicMaterial({color: 0x3366ff});
+const matR = new THREE.LineBasicMaterial({color: 0xcc8888});
+const matG = new THREE.LineBasicMaterial({color: 0x88aa88});
+const matB = new THREE.LineBasicMaterial({color: 0x8899bb});
 scene.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0,0,0), new THREE.Vector3(axisLen,0,0)]), matR));
 scene.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0,0,0), new THREE.Vector3(0,axisLen,0)]), matG));
 scene.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0,0,0), new THREE.Vector3(0,0,axisLen)]), matB));
@@ -88,15 +88,25 @@ scene.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vec
 // Trajectory
 const trajPoints = [];
 const trajGeom = new THREE.BufferGeometry();
-const trajCloud = new THREE.Points(trajGeom, new THREE.PointsMaterial({ color: 0x44ff88, size: 0.08 }));
+const trajCloud = new THREE.Points(trajGeom, new THREE.PointsMaterial({ color: 0x6b5e4f, size: 0.06 }));
 scene.add(trajCloud);
 const trajLineGeom = new THREE.BufferGeometry();
-const trajLine = new THREE.Line(trajLineGeom, new THREE.LineBasicMaterial({ color: 0x44ff88, transparent: true, opacity: 0.4 }));
+const trajLine = new THREE.Line(trajLineGeom, new THREE.LineBasicMaterial({ color: 0x6b5e4f, transparent: true, opacity: 0.5 }));
 scene.add(trajLine);
 
-// Point Cloud
+// Point Cloud — accumulated, downsampled, terracotta single color
+const pcAccum = [];                 // all accumulated points
+const pcVoxelMap = new Map();       // voxel grid for dedup
+const VOXEL_SIZE = 0.15;            // 15cm voxel grid
+const PC_FRAME_SKIP = 10;           // process 1 in every N frames
+let pcFrameCount = 0;
 const pcGeom = new THREE.BufferGeometry();
-const pcCloud = new THREE.Points(pcGeom, new THREE.PointsMaterial({ color: 0xffaa44, size: 0.04, sizeAttenuation: true }));
+const pcMat = new THREE.PointsMaterial({
+  color: 0xcc6b3d,
+  size: 0.05,
+  sizeAttenuation: true,
+});
+const pcCloud = new THREE.Points(pcGeom, pcMat);
 scene.add(pcCloud);
 
 // ═══════════════════════════════════════════════════════
@@ -413,6 +423,11 @@ function handleOdometry(msg) {
 
 function handlePointCloud(msg) {
   if (!msg.data || msg.width === 0) return;
+
+  // Throttle: only process 1 in every N frames
+  pcFrameCount++;
+  if (pcFrameCount % PC_FRAME_SKIP !== 0) return;
+
   const raw = atob(msg.data);
   const bytes = new Uint8Array(raw.length);
   for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
@@ -425,17 +440,34 @@ function handlePointCloud(msg) {
   }
 
   const view = new DataView(bytes.buffer);
-  const points = [];
+  let added = 0;
+
   for (let i = 0; i < msg.width; i++) {
     const off = i * msg.point_step;
-    points.push(rosToThree(
+    const pt = rosToThree(
       view.getFloat32(off + ox, true),
       view.getFloat32(off + oy, true),
       view.getFloat32(off + oz, true)
-    ));
+    );
+
+    // Voxel downsampling: deduplicate by grid cell
+    const vx = Math.round(pt.x / VOXEL_SIZE);
+    const vy = Math.round(pt.y / VOXEL_SIZE);
+    const vz = Math.round(pt.z / VOXEL_SIZE);
+    const key = `${vx},${vy},${vz}`;
+    if (pcVoxelMap.has(key)) continue;
+    pcVoxelMap.set(key, true);
+
+    pcAccum.push(pt);
+    added++;
   }
-  pcGeom.setFromPoints(points);
-  document.getElementById('pc-count').textContent = points.length;
+
+  // Cap accumulated points at 2M
+  while (pcAccum.length > 2000000) pcAccum.shift();
+
+  // Update geometry
+  pcGeom.setFromPoints(pcAccum);
+  document.getElementById('pc-count').textContent = pcAccum.length;
 }
 
 // ═══════════════════════════════════════════════════════

@@ -183,12 +183,12 @@ def parse_urdf(urdf_path: str):
 # Mesh loading + transform baking (to link-local frame)
 # ═══════════════════════════════════════════════════════════════
 
-def load_and_transform_mesh(link_info: dict) -> trimesh.Trimesh | None:
+def load_and_transform_mesh(link_info: dict, extra_tf: np.ndarray = None) -> trimesh.Trimesh | None:
     """
     Load a DAE mesh and apply transforms to bring it into link-local coordinates.
 
     Pipeline:
-      raw_dae → scale → DAE_scene_tx → URDF_visual_origin → link-local
+      raw_dae → scale → DAE_scene_tx → URDF_visual_origin → extra_tf → link-local
 
     Returns a trimesh.Trimesh or None.
     """
@@ -235,6 +235,10 @@ def load_and_transform_mesh(link_info: dict) -> trimesh.Trimesh | None:
 
     # 4) Combined transform: DAE_scene_tf first, then visual_origin on top
     combined_tf = vis_tf @ dae_scene_tf
+
+    # 5) Apply extra transform (e.g. rear leg 180° Y flip)
+    if extra_tf is not None and not np.allclose(extra_tf, np.eye(4)):
+        combined_tf = extra_tf @ combined_tf
 
     # Apply to vertices
     if not np.allclose(combined_tf, np.eye(4)):
@@ -363,16 +367,26 @@ def build_mesh_cache(links):
             mesh_for_link[name] = None
             continue
 
+        # Rear legs (RR/RL): flip mesh 180° around Y — same DAE as front, different visual
+        is_rear = name.startswith('RR_') or name.startswith('RL_')
+        rear_flip = np.array([
+            [-1, 0, 0, 0],
+            [ 0, 1, 0, 0],
+            [ 0, 0,-1, 0],
+            [ 0, 0, 0, 1],
+        ], dtype=np.float32) if is_rear else None
+
         key = (
             link['mesh_path'],
             tuple(round(v, 6) for v in link['vis_xyz']),
             tuple(round(v, 6) for v in link['vis_rpy']),
             tuple(round(v, 6) for v in link['scale']),
+            is_rear,  # rear legs get separate mesh instances
         )
 
         if key not in key_to_mesh:
             print(f"  Loading {Path(link['mesh_path']).name} for {name}...", end=' ')
-            mesh = load_and_transform_mesh(link)
+            mesh = load_and_transform_mesh(link, extra_tf=rear_flip)
             key_to_mesh[key] = mesh
             if mesh is not None:
                 print(f"{len(mesh.vertices)} verts, {len(mesh.faces)} faces")

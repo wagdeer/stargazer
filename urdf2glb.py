@@ -1,56 +1,108 @@
 #!/usr/bin/env python3
 """
-Convert URDF + Collada (DAE) meshes to a single GLB file for three.js.
-No urdf-loader dependency — one GLTFLoader.load() call.
-
-Usage: python3 urdf2glb.py models/go1/go1.urdf models/go1/go1.glb
+URDF + Collada DAE → GLB converter with proper node hierarchy.
+No trimesh dependency for export — builds GLTF JSON + binary buffer directly.
 """
-import sys
+import sys, os, struct, json, base64
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from collections import OrderedDict
-import trimesh
 import numpy as np
-import json
-import struct
-import base64
 
-URDF_NS = {'xacro': 'http://www.ros.org/wiki/xacro'}
+# ── DAE parser (no pycollada needed, just XML) ──
+def parse_dae(dae_path):
+    """Extract vertex positions and triangle indices from Collada file."""
+    ns = {'c': 'http://www.collada.org/2005/11/COLLADASchema'}
+    tree = ET.parse(dae_path)
+    root = tree.getroot()
 
+    meshes = []
+    for geom in root.findall('.//c:library_geometries/c:geometry', ns):
+        mesh_el = geom.find('c:mesh', ns)
+        if mesh_el is None:
+            continue
+
+        # Find position source
+        vertices_el = mesh_el.find('c:vertices', ns)
+        if vertices_el is None:
+            continue
+        input_el = vertices_el.find('c:input[@semantic="POSITION"]', ns)
+        if input_el is None:
+            continue
+        source_id = input_el.get('source', '').lstrip('#')
+
+        # Find the float array for positions
+        pos_source = mesh_el.find(f'c:source[@id="{source_id}"]', ns)
+        if pos_source is None:
+            continue
+        float_array = pos_source.find('c:float_array', ns)
+        accessor = pos_source.find('c:technique_common/c:accessor', ns)
+
+        if float_array is None or accessor is None:
+            continue
+
+        count = int(accessor.get('count', 0))
+        stride = int(accessor.get('stride', 3))
+        verts = np.array([float(x) for x in float_array.text.split()], dtype=np.float32)
+        verts = verts.reshape(count, stride)[:, :3]  # take xyz
+
+        # Get triangle indices
+        triangles_el = mesh_el.find('c:triangles', ns)
+        if triangles_el is not None:
+            p_input = triangles_el.find('c:input[@semantic="VERTEX"]', ns)
+            if p_input is not None:
+                p_offset = int(p_input.get('offset', 0))
+                p_el = triangles_el.find('c:p', ns)
+                if p_el is not None:
+                    all_indices = np.array([int(x) for x in p_el.text.split()], dtype=np.uint32)
+                    num_inputs = len(triangles_el.findall('c:input', ns))
+                    faces = all_indices[p_offset::num_inputs].reshape(-1, 3)
+                    meshes.append({'vertices': verts, 'faces': faces})
+
+    if not meshes:
+        return None
+
+    # Merge all meshes from this file
+    all_verts = []
+    all_faces = []
+    voff = 0
+    for m in meshes:
+        all_verts.append(m['vertices'])
+        all_faces.append(m['faces'] + voff)
+        voff += len(m['vertices'])
+    return {'vertices': np.vstack(all_verts), 'faces': np.vstack(all_faces)}
+
+
+# ── URDF parser ──
 def parse_urdf(urdf_path):
-    """Extract joint tree and link mesh references from URDF."""
     tree = ET.parse(urdf_path)
     root = tree.getroot()
     urdf_dir = Path(urdf_path).parent
 
     links = {}
     joints = []
-    joint_map = {}  # child_link -> joint_name
 
     for link in root.findall('link'):
         name = link.get('name')
         visual = link.find('visual')
-        mesh = None
+        mesh_ref = None
         origin_xyz = [0,0,0]
         origin_rpy = [0,0,0]
 
         if visual is not None:
             origin_el = visual.find('origin')
             if origin_el is not None:
-                xyz = origin_el.get('xyz', '0 0 0')
-                rpy = origin_el.get('rpy', '0 0 0')
-                origin_xyz = [float(v) for v in xyz.split()]
-                origin_rpy = [float(v) for v in rpy.split()]
+                origin_xyz = [float(v) for v in origin_el.get('xyz', '0 0 0').split()]
+                origin_rpy = [float(v) for v in origin_el.get('rpy', '0 0 0').split()]
             geom = visual.find('geometry')
             if geom is not None:
                 mesh_el = geom.find('mesh')
                 if mesh_el is not None:
-                    mesh_path = mesh_el.get('filename')
-                    scale = mesh_el.get('scale', '1 1 1')
-                    mesh_path = str((urdf_dir / mesh_path).resolve())
-                    mesh = {'path': mesh_path, 'scale': [float(s) for s in scale.split()]}
+                    mesh_path = str((urdf_dir / mesh_el.get('filename')).resolve())
+                    scale = [float(s) for s in mesh_el.get('scale', '1 1 1').split()]
+                    mesh_ref = {'path': mesh_path, 'scale': scale}
 
-        links[name] = {'mesh': mesh, 'xyz': origin_xyz, 'rpy': origin_rpy}
+        links[name] = {'mesh': mesh_ref, 'xyz': origin_xyz, 'rpy': origin_rpy}
 
     for joint in root.findall('joint'):
         jtype = joint.get('type', 'fixed')
@@ -63,16 +115,13 @@ def parse_urdf(urdf_path):
         if origin_el is not None:
             xyz = [float(v) for v in origin_el.get('xyz', '0 0 0').split()]
             rpy = [float(v) for v in origin_el.get('rpy', '0 0 0').split()]
-
         joints.append({'name': name, 'parent': parent, 'child': child,
                        'xyz': xyz, 'rpy': rpy, 'type': jtype})
-        joint_map[child] = name
 
-    return links, joints, joint_map
+    return links, joints
 
 
-def rpy_to_matrix(rpy):
-    """Convert roll-pitch-yaw to 4x4 transform matrix."""
+def rpy_to_mat4(rpy, xyz):
     r, p, y = rpy
     cr, sr = np.cos(r), np.sin(r)
     cp, sp = np.cos(p), np.sin(p)
@@ -80,121 +129,184 @@ def rpy_to_matrix(rpy):
     R = np.array([
         [cy*cp, cy*sp*sr - sy*cr, cy*sp*cr + sy*sr],
         [sy*cp, sy*sp*sr + cy*cr, sy*sp*cr - cy*sr],
-        [-sp,   cp*sr,            cp*cr]
-    ])
-    return R
+        [-sp, cp*sr, cp*cr]
+    ], dtype=np.float32)
+    T = np.eye(4, dtype=np.float32)
+    T[:3, :3] = R
+    T[:3, 3] = xyz
+    return T
 
 
-def load_mesh_cache(urdf_dir, links):
-    """Load each unique DAE mesh, convert to trimesh, return cached dict."""
-    cache = {}
-    for link_name, link in links.items():
-        if link['mesh'] is None:
-            continue
-        path = link['mesh']['path']
-        if path in cache:
-            continue
-        try:
-            mesh = trimesh.load(path, force='mesh')
-            if isinstance(mesh, trimesh.Scene):
-                # flatten scene to single mesh
-                meshes = []
-                for g in mesh.geometry.values():
-                    if hasattr(g, 'vertices'):
-                        meshes.append(g)
-                if meshes:
-                    mesh = trimesh.util.concatenate(meshes)
-                else:
-                    mesh = trimesh.Trimesh()
-            cache[path] = mesh
-            print(f"  Loaded {Path(path).name}: {len(mesh.vertices)} verts, {len(mesh.faces)} faces")
-        except Exception as e:
-            print(f"  WARN: Failed to load {path}: {e}")
-            cache[path] = trimesh.Trimesh()
-    return cache
+# ── GLB Builder ──
+class GLBBuilder:
+    def __init__(self):
+        self.nodes = []           # list of node dicts
+        self.meshes = []          # list of mesh dicts
+        self.accessors = []       # list of accessor dicts
+        self.bufferViews = []     # list of bufferView dicts
+        self.buffers = []         # list of bytearrays
+        self.mesh_index = {}      # link_name -> mesh index
+        self.node_index = {}      # link_name -> node index
+        self.root_node = None
+
+    def add_mesh(self, vertices, faces, node_name, parent_name=None):
+        """Add a mesh primitive and create a node for it."""
+        verts = vertices.astype(np.float32)
+        indices = faces.astype(np.uint32)
+        verts_bytes = verts.tobytes()
+        indices_bytes = indices.tobytes()
+
+        # Pad to 4-byte alignment
+        while len(verts_bytes) % 4: verts_bytes += b'\x00'
+        while len(indices_bytes) % 4: indices_bytes += b'\x00'
+
+        buf = self.buffers[0] if self.buffers else bytearray()
+        if not self.buffers:
+            self.buffers.append(buf)
+
+        # Vertex buffer view
+        vbv_offset = len(buf)
+        buf.extend(verts_bytes)
+        vbv_len = len(verts_bytes)
+        self.bufferViews.append({
+            'buffer': 0, 'byteOffset': vbv_offset, 'byteLength': vbv_len,
+            'target': 34962  # ARRAY_BUFFER
+        })
+
+        # Index buffer view
+        ibv_offset = len(buf)
+        buf.extend(indices_bytes)
+        ibv_len = len(indices_bytes)
+        self.bufferViews.append({
+            'buffer': 0, 'byteOffset': ibv_offset, 'byteLength': ibv_len,
+            'target': 34963  # ELEMENT_ARRAY_BUFFER
+        })
+
+        # Accessors
+        min_vals = verts.min(axis=0).tolist()
+        max_vals = verts.max(axis=0).tolist()
+        self.accessors.append({
+            'bufferView': len(self.bufferViews) - 2,
+            'componentType': 5126,  # FLOAT
+            'count': len(verts),
+            'type': 'VEC3',
+            'min': min_vals,
+            'max': max_vals,
+        })
+        pos_acc = len(self.accessors) - 1
+
+        self.accessors.append({
+            'bufferView': len(self.bufferViews) - 1,
+            'componentType': 5125,  # UNSIGNED_INT
+            'count': len(indices) * 3,
+            'type': 'SCALAR',
+        })
+        idx_acc = len(self.accessors) - 1
+
+        mi = len(self.meshes)
+        self.meshes.append({
+            'primitives': [{
+                'attributes': {'POSITION': pos_acc},
+                'indices': idx_acc,
+                'mode': 4,  # TRIANGLES
+            }]
+        })
+
+        # Node
+        ni = len(self.nodes)
+        self.nodes.append({'name': node_name, 'mesh': mi})
+        self.node_index[node_name] = ni
+        self.mesh_index[node_name] = mi
+
+        return ni
+
+    def add_empty_node(self, name):
+        ni = len(self.nodes)
+        self.nodes.append({'name': name})
+        self.node_index[name] = ni
+        return ni
+
+    def add_node(self, name):
+        """Alias: ensure node exists (no mesh)."""
+        if name not in self.node_index:
+            return self.add_empty_node(name)
+        return self.node_index[name]
+
+    def set_parent(self, child_name, parent_name):
+        ci = self.node_index[child_name]
+        pi = self.node_index.get(parent_name)
+        if pi is not None:
+            self.nodes[ci]['_parent'] = pi
+
+    def build_children(self):
+        """Convert _parent to children arrays, build root list."""
+        children = [[] for _ in range(len(self.nodes))]
+        for i, n in enumerate(self.nodes):
+            p = n.pop('_parent', None)
+            if p is not None:
+                children[p].append(i)
+
+        root_nodes = []
+        for i in range(len(self.nodes)):
+            if children[i]:
+                self.nodes[i]['children'] = children[i]
+            # Root: node not referenced as child by anyone, and no _parent
+        # Find roots
+        is_child = set()
+        for n in self.nodes:
+            for c in n.get('children', []):
+                is_child.add(c)
+        for i in range(len(self.nodes)):
+            if i not in is_child:
+                root_nodes.append(i)
+
+        return root_nodes
+
+    def export(self, path):
+        roots = self.build_children()
+        root_node_idx = roots[0] if roots else 0
+
+        gltf = {
+            'asset': {'version': '2.0'},
+            'scene': 0,
+            'scenes': [{'nodes': [root_node_idx]}],
+            'nodes': self.nodes,
+            'meshes': self.meshes,
+            'accessors': self.accessors,
+            'bufferViews': self.bufferViews,
+            'buffers': [{'byteLength': len(self.buffers[0])}],
+        }
+
+        json_str = json.dumps(gltf, separators=(',', ':'), ensure_ascii=False)
+        # Pad JSON to 4-byte alignment
+        while len(json_str) % 4:
+            json_str += ' '
+        json_bytes = json_str.encode('utf-8')
+
+        bin_data = bytes(self.buffers[0])
+
+        # GLB header
+        total_len = 12 + 8 + len(json_bytes) + 8 + len(bin_data)
+        glb = struct.pack('<I', 0x46546C67)  # magic
+        glb += struct.pack('<I', 2)           # version
+        glb += struct.pack('<I', total_len)   # total length
+
+        # JSON chunk
+        glb += struct.pack('<I', len(json_bytes))
+        glb += struct.pack('<I', 0x4E4F534A)  # 'JSON'
+        glb += json_bytes
+
+        # BIN chunk
+        glb += struct.pack('<I', len(bin_data))
+        glb += struct.pack('<I', 0x004E4942)  # 'BIN\0'
+        glb += bin_data
+
+        with open(path, 'wb') as f:
+            f.write(glb)
+        print(f"  Exported {path} ({len(glb)/1e6:.1f} MB)")
 
 
-def build_gltf(links, joints, joint_map, mesh_cache, output_path):
-    """Build GLB binary from hierarchy."""
-    # Find root link (not a child of any joint)
-    all_children = {j['child'] for j in joints}
-    root_link = None
-    for name in links:
-        if name not in all_children:
-            root_link = name
-            break
-
-    if root_link is None:
-        root_link = list(links.keys())[0]
-
-    # Build parent->children map
-    children_of = {}
-    for j in joints:
-        parent = j['parent']
-        children_of.setdefault(parent, []).append(j)
-
-    # Use trimesh's scene export
-    scene = trimesh.Scene()
-    
-    def add_link(link_name, parent_node=None):
-        link = links[link_name]
-
-        has_mesh = link['mesh'] is not None
-        mesh_node = None
-
-        if has_mesh:
-            path = link['mesh']['path']
-            scale = link['mesh']['scale']
-            mesh = mesh_cache.get(path)
-            if mesh is not None and len(mesh.vertices) > 0:
-                m = mesh.copy()
-                m.apply_scale(scale)
-                R_link = rpy_to_matrix(link['rpy'])
-                T_link_local = np.eye(4)
-                T_link_local[:3,:3] = R_link
-                T_link_local[:3,3] = link['xyz']
-                m.apply_transform(T_link_local)
-                mesh_node = scene.add_geometry(m, node_name=link_name, parent_node_name=parent_node)
-            else:
-                mesh_node = scene.add_geometry(trimesh.Trimesh(), node_name=link_name, parent_node_name=parent_node)
-        else:
-            mesh_node = scene.add_geometry(trimesh.Trimesh(), node_name=link_name, parent_node_name=parent_node)
-
-        # Process child joints: apply joint transform, add child link directly
-        child_joints = children_of.get(link_name, [])
-        for cj in child_joints:
-            Rj = rpy_to_matrix(cj['rpy'])
-            Tj = np.eye(4)
-            Tj[:3,:3] = Rj
-            Tj[:3,3] = cj['xyz']
-
-            child_link = cj['child']
-            cl = links[child_link]
-            # Merge joint transform with child link's origin
-            Rcl = rpy_to_matrix(cl['rpy'])
-            Tcl = np.eye(4)
-            Tcl[:3,:3] = Rcl
-            Tcl[:3,3] = cl['xyz']
-            T = Tj @ Tcl
-
-            if cl['mesh'] is not None:
-                path = cl['mesh']['path']
-                mesh = mesh_cache.get(path)
-                if mesh is not None and len(mesh.vertices) > 0:
-                    m = mesh.copy()
-                    m.apply_scale(cl['mesh']['scale'])
-                    m.apply_transform(T)
-                    scene.add_geometry(m, node_name=child_link, parent_node_name=link_name)
-
-            # Recurse into grandchildren
-            add_link(child_link, parent_node=link_name)
-
-    add_link(root_link)
-    scene.export(output_path, file_type='glb')
-    print(f"\nExported {output_path}")
-    return True
-
-
+# ── Main ──
 def main():
     if len(sys.argv) < 2:
         print(f"Usage: {sys.argv[0]} <urdf_path> [output.glb]")
@@ -203,17 +315,85 @@ def main():
     urdf_path = sys.argv[1]
     output_path = sys.argv[2] if len(sys.argv) > 2 else Path(urdf_path).with_suffix('.glb')
 
-    urdf_dir = Path(urdf_path).parent
-
     print(f"Parsing URDF: {urdf_path}")
-    links, joints, joint_map = parse_urdf(urdf_path)
+    links, joints = parse_urdf(urdf_path)
     print(f"  {len(links)} links, {len(joints)} joints")
 
-    print("Loading meshes...")
-    mesh_cache = load_mesh_cache(urdf_dir, links)
+    # Load meshes
+    mesh_cache = {}
+    for name, link in links.items():
+        if link['mesh'] is None:
+            continue
+        path = link['mesh']['path']
+        if path in mesh_cache:
+            continue
+        print(f"  Loading {Path(path).name}...")
+        mesh_data = parse_dae(path)
+        if mesh_data is not None:
+            mesh_cache[path] = mesh_data
+            print(f"    {len(mesh_data['vertices'])} verts, {len(mesh_data['faces'])} faces")
+        else:
+            print(f"    WARN: failed to parse")
 
-    print("Building GLB...")
-    build_gltf(links, joints, joint_map, mesh_cache, output_path)
+    # Build GLB
+    builder = GLBBuilder()
+
+    # First pass: create nodes for all links
+    for name in links:
+        builder.add_node(name)
+
+    # Find root (link not a child of any joint)
+    all_children = {j['child'] for j in joints}
+    root_link = None
+    for name in links:
+        if name not in all_children:
+            root_link = name
+            break
+
+    # Second pass: add meshes and set transforms
+    for j in joints:
+        parent = j['parent']
+        child = j['child']
+        child_link = links[child]
+
+        # Compute transform: joint origin → child link origin
+        Tj = rpy_to_mat4(j['rpy'], j['xyz'])
+        Tcl = rpy_to_mat4(child_link.get('rpy', [0,0,0]), child_link.get('xyz', [0,0,0]))
+        T = Tj @ Tcl
+
+        if child_link['mesh'] is not None:
+            mesh_path = child_link['mesh']['path']
+            scale = child_link['mesh']['scale']
+            mesh_data = mesh_cache.get(mesh_path)
+            if mesh_data is not None and len(mesh_data['vertices']) > 0:
+                verts = mesh_data['vertices'].copy()
+                # Apply scale
+                verts[:, 0] *= scale[0]
+                verts[:, 1] *= scale[1]
+                verts[:, 2] *= scale[2]
+                # Apply transform
+                ones = np.ones((len(verts), 1), dtype=np.float32)
+                verts_h = np.hstack([verts, ones])
+                verts_t = (T @ verts_h.T).T[:, :3]
+                builder.add_mesh(verts_t, mesh_data['faces'], child, parent)
+            else:
+                builder.add_empty_node(child)
+        else:
+            builder.add_empty_node(child)
+
+    # Add mesh for root link
+    if root_link and links[root_link]['mesh'] is not None:
+        mesh_data = mesh_cache.get(links[root_link]['mesh']['path'])
+        if mesh_data is not None:
+            verts = mesh_data['vertices'].copy()
+            scale = links[root_link]['mesh']['scale']
+            verts[:, 0] *= scale[0]; verts[:, 1] *= scale[1]; verts[:, 2] *= scale[2]
+            T_root = rpy_to_mat4(links[root_link]['rpy'], links[root_link]['xyz'])
+            ones = np.ones((len(verts), 1), dtype=np.float32)
+            verts = (T_root @ np.hstack([verts, ones]).T).T[:, :3]
+            builder.add_mesh(verts, mesh_data['faces'], root_link)
+
+    builder.export(output_path)
 
 
 if __name__ == '__main__':

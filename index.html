@@ -399,7 +399,9 @@ function handleOdometry(msg) {
   trajPoints.push(pos);
   if (trajPoints.length > 10000) trajPoints.shift();
   trajGeom.setFromPoints(trajPoints);
+  trajGeom.computeBoundingSphere();
   trajLineGeom.setFromPoints(trajPoints);
+  trajLineGeom.computeBoundingSphere();
   document.getElementById('traj-count').textContent = trajPoints.length;
 
   const q = msg.pose.pose.orientation;

@@ -2,7 +2,7 @@
 
 [中文文档](README-zh.md)
 
-Realtime 3D web viewer for robot swarms. Visualizes trajectories, point clouds, and URDF models directly from ROS 2 topics — no frontend code required.
+Realtime 3D web viewer for robot swarms. Visualizes trajectories, point clouds, and animated URDF models directly from ROS 2 topics — no frontend code required.
 
 Built on [three.js](https://threejs.org) + [rosbridge](https://github.com/RobotWebTools/rosbridge_suite). Dark by default.
 
@@ -27,9 +27,9 @@ Browser (phone / desktop)
                                           └───────────┘
 ```
 
-- **nginx** serves the single-page app and proxies WebSocket traffic on a single port (no CORS / firewall headaches).
+- **nginx** serves the single-page app + models and proxies WebSocket traffic on a single port.
 - **rosbridge** bridges ROS 2 topics to the browser via WebSocket.
-- **three.js** renders everything client-side — no server-side rendering, zero backend state.
+- **three.js** renders everything client-side — including GLTF robot models with articulated joints.
 
 ---
 
@@ -50,7 +50,7 @@ rosbridge listens on `ws://localhost:9090` by default.
 ```bash
 docker run -d --name stargazer \
   -p 8080:8080 \
-  -v $(pwd)/index.html:/usr/share/nginx/html/index.html:ro \
+  -v $(pwd):/usr/share/nginx/html:ro \
   -v $(pwd)/nginx.conf:/etc/nginx/nginx.conf:ro \
   --add-host=host.docker.internal:host-gateway \
   nginx:alpine
@@ -66,9 +66,63 @@ The HUD shows connection status. Green = connected to rosbridge.
 
 ---
 
-## ROS 2 Topics
+## Robot Model — URDF → GLB
 
-stargazer subscribes to standard ROS 2 message types. Topic names are hardcoded in `index.html` — edit the `subscribe` calls to match your setup.
+stargazer loads articulated robot models from GLB files. The converter `urdf2glb.py` turns URDF + Collada DAE meshes into GLB with proper kinematic node hierarchy and link-local mesh coordinates — joints are preserved as GLTF node transforms and can be animated at runtime.
+
+### Convert a URDF
+
+```bash
+# Install deps
+pip install -r requirements.txt
+
+# Convert
+python3 urdf2glb.py models/go1/go1.urdf models/go1/go1.glb
+```
+
+### Or use Docker
+
+```bash
+docker build -t stargazer-converter .
+docker run --rm -v $(pwd):/work stargazer-converter models/go1/go1.urdf models/go1/go1.glb
+```
+
+### How it works
+
+```
+DAE raw mesh
+  → apply DAE scene node transform  (corrects CAD export orientation)
+  → apply URDF visual origin        (link-local placement)
+  → store as link-local vertex data
+
+GLTF node = joint origin            (kinematic chain, unique per joint)
+GLTF hierarchy = URDF joint tree    (base → trunk → FR_hip → FR_thigh → FR_calf)
+```
+
+Meshes with identical (DAE file, visual origin, scale) are deduplicated at conversion time.
+
+---
+
+## Joint Animation
+
+Joint definitions live in `index.html` → `JOINT_DEFS`. Each entry maps a GLTF node name to its rotation axis (from the URDF joint axis).
+
+```js
+const JOINT_DEFS = {
+  FR_hip:  { axis: [1, 0, 0] },  // revolute around X (abduction)
+  FR_thigh: { axis: [0, 1, 0] },  // revolute around Y (hip pitch)
+  FR_calf:  { axis: [0, 1, 0] },  // revolute around Y (knee)
+  // ... 12 joints total (4 legs × 3 DOF)
+};
+```
+
+The walking gait (`updateGait()`) drives joint angles with sinusoidal patterns in a trot gait (diagonal pairs in phase). Edit `gait` parameters to adjust speed and amplitude.
+
+The robot base (`base` node) follows SLAM odometry — position and orientation are set from `/odom` messages in the original ROS frame. The `robotRoot` group applies the ROS→three.js coordinate transform.
+
+---
+
+## ROS 2 Topics
 
 | Topic | Message Type | What It Shows |
 |---|---|---|
@@ -93,7 +147,11 @@ Then add a handler in the `onmessage` callback and a corresponding render functi
 
 ## Coordinate Frames
 
-ROS uses `X-forward, Y-left, Z-up`. three.js defaults to `Y-up`. stargazer remaps:
+ROS uses `X-forward, Y-left, Z-up`. three.js defaults to `Y-up`.
+
+**GLB models** are stored in the ROS/URDF frame. The `robotRoot` group applies a `-π/2` X rotation at runtime to convert the entire robot to three.js space.
+
+**Point clouds and trajectories** are converted per-point by `rosToThree()`:
 
 ```
 three_x =  ros_x
@@ -101,13 +159,9 @@ three_y =  ros_z
 three_z = -ros_y
 ```
 
-The remap function lives at the top of the odometry and point cloud handlers — easy to adjust for your convention.
-
 ---
 
 ## Mobile Access (WSL / Windows)
-
-If you're running stargazer on WSL and want to view it on your phone:
 
 ### 1. Set up Windows port forwarding (once)
 
@@ -164,20 +218,24 @@ All rendering logic is in a single HTML file. Key knobs:
 |---|---|
 | Topic subscriptions | `connect()` function |
 | Coordinate mapping | `rosToThree()` helper |
+| Joint definitions | `JOINT_DEFS` object |
+| Gait speed / amplitude | `gait` object |
 | Scene colors / fog / grid | Scene Setup section |
 | Point cloud size | `pcMat` material `size` |
 | Trajectory color / width | `trajMat` and `trajLine` materials |
-| Robot model | Replace `BoxGeometry` with a GLTF or URDF loader |
 
 ---
 
 ## Dependencies
 
-Everything is loaded from CDN at runtime — no `npm install` required.
-
 - [three.js](https://threejs.org) (v0.160, via importmap CDN)
 - [rosbridge_suite](https://github.com/RobotWebTools/rosbridge_suite) (ROS 2 Humble)
-- [nginx:alpine](https://hub.docker.com/_/nginx) (Docker)
+- [nginx:alpine](https://hub.docker.com/_/nginx) (Docker, for serving)
+
+For URDF → GLB conversion:
+- [trimesh](https://trimesh.org) (DAE loading + GLTF export)
+- [pycollada](https://github.com/pycollada/pycollada) (DAE scene transform extraction)
+- numpy
 
 ---
 

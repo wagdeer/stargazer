@@ -1,127 +1,73 @@
 #!/usr/bin/env python3
 """
-URDF + Collada DAE → GLB converter with proper node hierarchy.
-No trimesh dependency for export — builds GLTF JSON + binary buffer directly.
+URDF + Collada DAE → GLB converter with proper kinematic node hierarchy.
+
+Architecture:
+  Layer 1 (this script): DAE raw mesh → link-local coords → GLB with joint tree
+  Layer 2 (GLB file):     Standard glTF 2.0, nodes = kinematic chain, vertices in link-local
+  Layer 3 (viewer):       Load GLB, animate joints, apply SLAM pose at runtime
+
+Transform chain per link:
+  raw_dae_verts → [DAE scene node transform] → [URDF visual origin] → link-local coords
+  GLTF node matrix = joint origin (kinematic chain only)
+
+Dependencies: trimesh, pycollada, numpy
 """
-import sys, os, struct, json, base64
+
+import sys, os
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from collections import OrderedDict
+
 import numpy as np
-
-# ── DAE parser (no pycollada needed, just XML) ──
-def parse_dae(dae_path):
-    """Extract vertex positions and triangle indices from Collada file."""
-    ns = {'c': 'http://www.collada.org/2005/11/COLLADASchema'}
-    tree = ET.parse(dae_path)
-    root = tree.getroot()
-
-    meshes = []
-    for geom in root.findall('.//c:library_geometries/c:geometry', ns):
-        mesh_el = geom.find('c:mesh', ns)
-        if mesh_el is None:
-            continue
-
-        # Find position source
-        vertices_el = mesh_el.find('c:vertices', ns)
-        if vertices_el is None:
-            continue
-        input_el = vertices_el.find('c:input[@semantic="POSITION"]', ns)
-        if input_el is None:
-            continue
-        source_id = input_el.get('source', '').lstrip('#')
-
-        # Find the float array for positions
-        pos_source = mesh_el.find(f'c:source[@id="{source_id}"]', ns)
-        if pos_source is None:
-            continue
-        float_array = pos_source.find('c:float_array', ns)
-        accessor = pos_source.find('c:technique_common/c:accessor', ns)
-
-        if float_array is None or accessor is None:
-            continue
-
-        count = int(accessor.get('count', 0))
-        stride = int(accessor.get('stride', 3))
-        verts = np.array([float(x) for x in float_array.text.split()], dtype=np.float32)
-        verts = verts.reshape(count, stride)[:, :3]  # take xyz
-
-        # Get triangle indices
-        triangles_el = mesh_el.find('c:triangles', ns)
-        if triangles_el is not None:
-            p_input = triangles_el.find('c:input[@semantic="VERTEX"]', ns)
-            if p_input is not None:
-                p_offset = int(p_input.get('offset', 0))
-                p_el = triangles_el.find('c:p', ns)
-                if p_el is not None:
-                    all_indices = np.array([int(x) for x in p_el.text.split()], dtype=np.uint32)
-                    num_inputs = len(triangles_el.findall('c:input', ns))
-                    faces = all_indices[p_offset::num_inputs].reshape(-1, 3)
-                    meshes.append({'vertices': verts, 'faces': faces})
-
-    if not meshes:
-        return None
-
-    # Merge all meshes from this file
-    all_verts = []
-    all_faces = []
-    voff = 0
-    for m in meshes:
-        all_verts.append(m['vertices'])
-        all_faces.append(m['faces'] + voff)
-        voff += len(m['vertices'])
-    return {'vertices': np.vstack(all_verts), 'faces': np.vstack(all_faces)}
+import trimesh
+from collada import Collada
 
 
-# ── URDF parser ──
-def parse_urdf(urdf_path):
-    tree = ET.parse(urdf_path)
-    root = tree.getroot()
-    urdf_dir = Path(urdf_path).parent
+# ═══════════════════════════════════════════════════════════════
+# Utility: DAE scene node transform extraction
+# ═══════════════════════════════════════════════════════════════
 
-    links = {}
-    joints = []
+def get_dae_scene_transform(dae_path: str) -> np.ndarray:
+    """
+    Extract the 4x4 transform matrix from the DAE's first geometry-bearing
+    scene node. Returns identity if no transform found.
 
-    for link in root.findall('link'):
-        name = link.get('name')
-        visual = link.find('visual')
-        mesh_ref = None
-        origin_xyz = [0,0,0]
-        origin_rpy = [0,0,0]
+    DAE files from DCC tools often have scene-node transforms that orient
+    the mesh from the modeler's coordinate system to the intended visual
+    frame. We must apply this before further processing.
+    """
+    try:
+        doc = Collada(dae_path, ignore=[Collada.options.noImageLoading])
+    except Exception:
+        return np.eye(4, dtype=np.float32)
 
-        if visual is not None:
-            origin_el = visual.find('origin')
-            if origin_el is not None:
-                origin_xyz = [float(v) for v in origin_el.get('xyz', '0 0 0').split()]
-                origin_rpy = [float(v) for v in origin_el.get('rpy', '0 0 0').split()]
-            geom = visual.find('geometry')
-            if geom is not None:
-                mesh_el = geom.find('mesh')
-                if mesh_el is not None:
-                    mesh_path = str((urdf_dir / mesh_el.get('filename')).resolve())
-                    scale = [float(s) for s in mesh_el.get('scale', '1 1 1').split()]
-                    mesh_ref = {'path': mesh_path, 'scale': scale}
+    scene = doc.scene
+    if scene is None:
+        return np.eye(4, dtype=np.float32)
 
-        links[name] = {'mesh': mesh_ref, 'xyz': origin_xyz, 'rpy': origin_rpy}
+    for node in scene.nodes:
+        # Find first node that has geometry children
+        has_geometry = any(
+            hasattr(c, 'geometry') and c.geometry is not None
+            for c in node.children
+        )
+        if has_geometry:
+            for transform in node.transforms:
+                # pycollada wraps transforms; MatrixTransform has .matrix
+                if hasattr(transform, 'matrix'):
+                    return np.array(transform.matrix, dtype=np.float32)
+            break
 
-    for joint in root.findall('joint'):
-        jtype = joint.get('type', 'fixed')
-        name = joint.get('name')
-        parent = joint.find('parent').get('link')
-        child = joint.find('child').get('link')
-        origin_el = joint.find('origin')
-        xyz = [0,0,0]
-        rpy = [0,0,0]
-        if origin_el is not None:
-            xyz = [float(v) for v in origin_el.get('xyz', '0 0 0').split()]
-            rpy = [float(v) for v in origin_el.get('rpy', '0 0 0').split()]
-        joints.append({'name': name, 'parent': parent, 'child': child,
-                       'xyz': xyz, 'rpy': rpy, 'type': jtype})
+    return np.eye(4, dtype=np.float32)
 
-    return links, joints
 
+# ═══════════════════════════════════════════════════════════════
+# URDF parsing
+# ═══════════════════════════════════════════════════════════════
 
 def rpy_to_mat4(rpy, xyz):
+    """Convert roll-pitch-yaw (radians) + translation to 4x4 matrix."""
     r, p, y = rpy
     cr, sr = np.cos(r), np.sin(r)
     cp, sp = np.cos(p), np.sin(p)
@@ -129,230 +75,100 @@ def rpy_to_mat4(rpy, xyz):
     R = np.array([
         [cy*cp, cy*sp*sr - sy*cr, cy*sp*cr + sy*sr],
         [sy*cp, sy*sp*sr + cy*cr, sy*sp*cr - cy*sr],
-        [-sp, cp*sr, cp*cr]
+        [-sp,   cp*sr,            cp*cr],
     ], dtype=np.float32)
     T = np.eye(4, dtype=np.float32)
     T[:3, :3] = R
-    T[:3, 3] = xyz
+    T[:3, 3] = np.array(xyz, dtype=np.float32)
     return T
 
-# ROS (X-fwd, Y-left, Z-up) → three.js (X-right, Y-up, Z-towards-viewer)
-ROS2THREE = np.array([[1,0,0],[0,0,-1],[0,1,0]], dtype=np.float32)
 
-def apply_transform(verts, T):
-    """Apply 4x4 T then ROS→three.js coordinate mapping."""
-    ones = np.ones((len(verts), 1), dtype=np.float32)
-    v = (T @ np.hstack([verts, ones]).T).T[:, :3]
-    return v @ ROS2THREE.T
+def parse_urdf(urdf_path: str):
+    """
+    Parse URDF and return (links, joints, root_link_name).
 
+    links: {name: {mesh_path, visual_origin_xyz, visual_origin_rpy, scale}}
+    joints: [{name, parent, child, xyz, rpy, type, axis}]
+    """
+    tree = ET.parse(urdf_path)
+    root_el = tree.getroot()
+    urdf_dir = Path(urdf_path).parent
 
-# ── GLB Builder ──
-class GLBBuilder:
-    def __init__(self):
-        self.nodes = []           # list of node dicts
-        self.meshes = []          # list of mesh dicts
-        self.accessors = []       # list of accessor dicts
-        self.bufferViews = []     # list of bufferView dicts
-        self.buffers = []         # list of bytearrays
-        self.mesh_index = {}      # link_name -> mesh index
-        self.node_index = {}      # link_name -> node index
-        self.root_node = None
+    links = OrderedDict()
+    joints = []
 
-    def add_mesh(self, vertices, faces, node_name, parent_name=None):
-        """Add a mesh primitive and create a node for it."""
-        if node_name in self.node_index:
-            # Node already exists — just set parent
-            if parent_name:
-                self.set_parent(node_name, parent_name)
-            return self.node_index[node_name]
-        verts = vertices.astype(np.float32)
-        indices = faces.astype(np.uint32)
-        verts_bytes = verts.tobytes()
-        indices_bytes = indices.tobytes()
+    for link in root_el.findall('link'):
+        name = link.get('name')
+        visual = link.find('visual')
+        mesh_path = None
+        vis_xyz = np.zeros(3, dtype=np.float32)
+        vis_rpy = np.zeros(3, dtype=np.float32)
+        scale = np.ones(3, dtype=np.float32)
 
-        # Pad to 4-byte alignment
-        while len(verts_bytes) % 4: verts_bytes += b'\x00'
-        while len(indices_bytes) % 4: indices_bytes += b'\x00'
+        if visual is not None:
+            origin_el = visual.find('origin')
+            if origin_el is not None:
+                vis_xyz = np.array(
+                    [float(v) for v in origin_el.get('xyz', '0 0 0').split()],
+                    dtype=np.float32
+                )
+                vis_rpy = np.array(
+                    [float(v) for v in origin_el.get('rpy', '0 0 0').split()],
+                    dtype=np.float32
+                )
+            geom = visual.find('geometry')
+            if geom is not None:
+                mesh_el = geom.find('mesh')
+                if mesh_el is not None:
+                    mesh_path = str((urdf_dir / mesh_el.get('filename')).resolve())
+                    scale = np.array(
+                        [float(s) for s in mesh_el.get('scale', '1 1 1').split()],
+                        dtype=np.float32
+                    )
 
-        buf = self.buffers[0] if self.buffers else bytearray()
-        if not self.buffers:
-            self.buffers.append(buf)
-
-        # Vertex buffer view
-        vbv_offset = len(buf)
-        buf.extend(verts_bytes)
-        vbv_len = len(verts_bytes)
-        self.bufferViews.append({
-            'buffer': 0, 'byteOffset': vbv_offset, 'byteLength': vbv_len,
-            'target': 34962  # ARRAY_BUFFER
-        })
-
-        # Index buffer view
-        ibv_offset = len(buf)
-        buf.extend(indices_bytes)
-        ibv_len = len(indices_bytes)
-        self.bufferViews.append({
-            'buffer': 0, 'byteOffset': ibv_offset, 'byteLength': ibv_len,
-            'target': 34963  # ELEMENT_ARRAY_BUFFER
-        })
-
-        # Accessors
-        min_vals = verts.min(axis=0).tolist()
-        max_vals = verts.max(axis=0).tolist()
-        self.accessors.append({
-            'bufferView': len(self.bufferViews) - 2,
-            'componentType': 5126,  # FLOAT
-            'count': len(verts),
-            'type': 'VEC3',
-            'min': min_vals,
-            'max': max_vals,
-        })
-        pos_acc = len(self.accessors) - 1
-
-        self.accessors.append({
-            'bufferView': len(self.bufferViews) - 1,
-            'componentType': 5125,  # UNSIGNED_INT
-            'count': len(indices) * 3,
-            'type': 'SCALAR',
-        })
-        idx_acc = len(self.accessors) - 1
-
-        mi = len(self.meshes)
-        self.meshes.append({
-            'primitives': [{
-                'attributes': {'POSITION': pos_acc},
-                'indices': idx_acc,
-                'mode': 4,  # TRIANGLES
-            }]
-        })
-
-        # Node
-        ni = len(self.nodes)
-        self.nodes.append({'name': node_name, 'mesh': mi})
-        self.node_index[node_name] = ni
-        self.mesh_index[node_name] = mi
-
-        return ni
-
-    def add_empty_node(self, name):
-        if name in self.node_index:
-            return self.node_index[name]
-        ni = len(self.nodes)
-        self.nodes.append({'name': name})
-        self.node_index[name] = ni
-        return ni
-
-    def add_node(self, name):
-        """Alias: ensure node exists (no mesh)."""
-        return self.add_empty_node(name)
-
-    def set_parent(self, child_name, parent_name):
-        ci = self.node_index[child_name]
-        pi = self.node_index.get(parent_name)
-        if pi is not None:
-            self.nodes[ci]['_parent'] = pi
-
-    def build_children(self):
-        """Convert _parent to children arrays, build root list."""
-        children = [[] for _ in range(len(self.nodes))]
-        for i, n in enumerate(self.nodes):
-            p = n.pop('_parent', None)
-            if p is not None:
-                children[p].append(i)
-
-        root_nodes = []
-        for i in range(len(self.nodes)):
-            if children[i]:
-                self.nodes[i]['children'] = children[i]
-            # Root: node not referenced as child by anyone, and no _parent
-        # Find roots
-        is_child = set()
-        for n in self.nodes:
-            for c in n.get('children', []):
-                is_child.add(c)
-        for i in range(len(self.nodes)):
-            if i not in is_child:
-                root_nodes.append(i)
-
-        return root_nodes
-
-    def export(self, path):
-        roots = self.build_children()
-        root_node_idx = roots[0] if roots else 0
-
-        gltf = {
-            'asset': {'version': '2.0'},
-            'scene': 0,
-            'scenes': [{'nodes': [root_node_idx]}],
-            'nodes': self.nodes,
-            'meshes': self.meshes,
-            'accessors': self.accessors,
-            'bufferViews': self.bufferViews,
-            'buffers': [{'byteLength': len(self.buffers[0])}],
+        links[name] = {
+            'mesh_path': mesh_path,
+            'vis_xyz': vis_xyz,
+            'vis_rpy': vis_rpy,
+            'scale': scale,
         }
 
-        json_str = json.dumps(gltf, separators=(',', ':'), ensure_ascii=False)
-        # Pad JSON to 4-byte alignment
-        while len(json_str) % 4:
-            json_str += ' '
-        json_bytes = json_str.encode('utf-8')
+    for joint in root_el.findall('joint'):
+        jtype = joint.get('type', 'fixed')
+        name = joint.get('name')
+        parent = joint.find('parent').get('link')
+        child = joint.find('child').get('link')
+        origin_el = joint.find('origin')
+        xyz = np.zeros(3, dtype=np.float32)
+        rpy = np.zeros(3, dtype=np.float32)
+        if origin_el is not None:
+            xyz = np.array(
+                [float(v) for v in origin_el.get('xyz', '0 0 0').split()],
+                dtype=np.float32
+            )
+            rpy = np.array(
+                [float(v) for v in origin_el.get('rpy', '0 0 0').split()],
+                dtype=np.float32
+            )
+        axis_el = joint.find('axis')
+        axis = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+        if axis_el is not None:
+            axis = np.array(
+                [float(v) for v in axis_el.get('xyz', '1 0 0').split()],
+                dtype=np.float32
+            )
 
-        bin_data = bytes(self.buffers[0])
+        joints.append({
+            'name': name,
+            'parent': parent,
+            'child': child,
+            'xyz': xyz,
+            'rpy': rpy,
+            'type': jtype,
+            'axis': axis,
+        })
 
-        # GLB header
-        total_len = 12 + 8 + len(json_bytes) + 8 + len(bin_data)
-        glb = struct.pack('<I', 0x46546C67)  # magic
-        glb += struct.pack('<I', 2)           # version
-        glb += struct.pack('<I', total_len)   # total length
-
-        # JSON chunk
-        glb += struct.pack('<I', len(json_bytes))
-        glb += struct.pack('<I', 0x4E4F534A)  # 'JSON'
-        glb += json_bytes
-
-        # BIN chunk
-        glb += struct.pack('<I', len(bin_data))
-        glb += struct.pack('<I', 0x004E4942)  # 'BIN\0'
-        glb += bin_data
-
-        with open(path, 'wb') as f:
-            f.write(glb)
-        print(f"  Exported {path} ({len(glb)/1e6:.1f} MB)")
-
-
-# ── Main ──
-def main():
-    if len(sys.argv) < 2:
-        print(f"Usage: {sys.argv[0]} <urdf_path> [output.glb]")
-        sys.exit(1)
-
-    urdf_path = sys.argv[1]
-    output_path = sys.argv[2] if len(sys.argv) > 2 else Path(urdf_path).with_suffix('.glb')
-
-    print(f"Parsing URDF: {urdf_path}")
-    links, joints = parse_urdf(urdf_path)
-    print(f"  {len(links)} links, {len(joints)} joints")
-
-    # Load meshes
-    mesh_cache = {}
-    for name, link in links.items():
-        if link['mesh'] is None:
-            continue
-        path = link['mesh']['path']
-        if path in mesh_cache:
-            continue
-        print(f"  Loading {Path(path).name}...")
-        mesh_data = parse_dae(path)
-        if mesh_data is not None:
-            mesh_cache[path] = mesh_data
-            print(f"    {len(mesh_data['vertices'])} verts, {len(mesh_data['faces'])} faces")
-        else:
-            print(f"    WARN: failed to parse")
-
-    # Build GLB — single pass, recursive tree walk
-    builder = GLBBuilder()
-
-    # Find root (link not a child of any joint)
+    # Find root link (not a child of any joint)
     all_children = {j['child'] for j in joints}
     root_link = None
     for name in links:
@@ -360,51 +176,316 @@ def main():
             root_link = name
             break
 
-    # Build children map for joints
+    return links, joints, root_link
+
+
+# ═══════════════════════════════════════════════════════════════
+# Mesh loading + transform baking (to link-local frame)
+# ═══════════════════════════════════════════════════════════════
+
+def load_and_transform_mesh(link_info: dict) -> trimesh.Trimesh | None:
+    """
+    Load a DAE mesh and apply transforms to bring it into link-local coordinates.
+
+    Pipeline:
+      raw_dae → scale → DAE_scene_tx → URDF_visual_origin → link-local
+
+    Returns a trimesh.Trimesh or None.
+    """
+    mesh_path = link_info['mesh_path']
+    if mesh_path is None or not os.path.exists(mesh_path):
+        return None
+
+    # Load with trimesh
+    try:
+        loaded = trimesh.load(mesh_path, force='mesh')
+    except Exception as e:
+        print(f"    WARN: trimesh failed to load {Path(mesh_path).name}: {e}")
+        return None
+
+    # Extract the first Trimesh (DAE may contain multiple geometries/scene nodes)
+    if isinstance(loaded, trimesh.Scene):
+        if len(loaded.geometry) == 0:
+            return None
+        # Take the first mesh geometry
+        geom = list(loaded.geometry.values())[0]
+        if not isinstance(geom, trimesh.Trimesh):
+            return None
+        mesh = geom.copy()
+    elif isinstance(loaded, trimesh.Trimesh):
+        mesh = loaded.copy()
+    else:
+        return None
+
+    if len(mesh.vertices) == 0:
+        return None
+
+    # 1) Apply scale
+    scale = link_info['scale']
+    if not np.allclose(scale, 1.0):
+        mesh.vertices[:, 0] *= scale[0]
+        mesh.vertices[:, 1] *= scale[1]
+        mesh.vertices[:, 2] *= scale[2]
+
+    # 2) Get DAE scene transform
+    dae_scene_tf = get_dae_scene_transform(mesh_path)
+
+    # 3) Get URDF visual origin transform
+    vis_tf = rpy_to_mat4(link_info['vis_rpy'], link_info['vis_xyz'])
+
+    # 4) Combined transform: DAE_scene_tf first, then visual_origin on top
+    combined_tf = vis_tf @ dae_scene_tf
+
+    # Apply to vertices
+    if not np.allclose(combined_tf, np.eye(4)):
+        verts = mesh.vertices
+        ones = np.ones((len(verts), 1), dtype=np.float32)
+        transformed = (combined_tf @ np.hstack([verts, ones]).T).T[:, :3]
+        mesh.vertices = transformed.astype(np.float32)
+
+    return mesh
+
+
+# ═══════════════════════════════════════════════════════════════
+# Scene graph construction
+# ═══════════════════════════════════════════════════════════════
+
+def build_scene_graph(links, joints, root_link, mesh_cache):
+    """
+    Build a trimesh.Scene with the full kinematic tree.
+
+    Strategy:
+      - Mesh-bearing links: scene.add_geometry() creates a node with geometry
+      - Meshless links: scene.graph.update() creates an empty transform frame
+      - Children reference their parent by link_name (frame or geometry node)
+
+    Joint origins become 4x4 node transform matrices.
+    Parent-child relationships follow the URDF joint tree.
+
+    Returns (scene, joint_info_map)
+    """
+    scene = trimesh.Scene()
+
+    # Build parent→child map
     children_of = {}
     for j in joints:
         children_of.setdefault(j['parent'], []).append(j)
 
-    def build_link(link_name, parent_node_name=None):
-        """Recursively add a link and its children to the GLB."""
+    # Joint info for each link (what joint connects it to its parent)
+    joint_for_link = {}
+    for j in joints:
+        joint_for_link[j['child']] = j
+
+    # ── Build tree bottom-up: leaves first ──
+    # We need to know which links need frames (no mesh but have children)
+    needs_frame = set()
+    for link_name, link in links.items():
+        if link['mesh_path'] is None:
+            # Check if it has children
+            if link_name in children_of:
+                needs_frame.add(link_name)
+
+    # Also root needs a frame if it has no mesh
+    if links[root_link]['mesh_path'] is None:
+        needs_frame.add(root_link)
+
+    # Track created nodes
+    created = set()
+    geom_count = 0
+
+    def build_node(link_name, parent_name):
+        """Create node for this link. Return the node name used."""
+        nonlocal geom_count
+
+        if link_name in created:
+            return link_name
+
         link = links[link_name]
 
-        if link['mesh'] is not None and link['mesh']['path'] in mesh_cache:
-            mesh_data = mesh_cache[link['mesh']['path']]
-            scale = link['mesh']['scale']
-            verts = mesh_data['vertices'].copy()
-            verts[:,0] *= scale[0]; verts[:,1] *= scale[1]; verts[:,2] *= scale[2]
-            T_link = rpy_to_mat4(link.get('rpy',[0,0,0]), link.get('xyz',[0,0,0]))
-            ones = np.ones((len(verts), 1), dtype=np.float32)
-            verts = apply_transform(verts, T_link)
-            node_idx = builder.add_mesh(verts, mesh_data['faces'], link_name, parent_node_name)
-        else:
-            node_idx = builder.add_empty_node(link_name)
+        # Compute joint transform
+        node_tf = np.eye(4, dtype=np.float32)
+        if link_name in joint_for_link:
+            j = joint_for_link[link_name]
+            node_tf = rpy_to_mat4(j['rpy'], j['xyz'])
 
-        # Process child joints: apply joint transform to child link's mesh
+        frame_from = parent_name if parent_name else 'world'
+
+        if link['mesh_path'] is not None and link_name in mesh_cache and mesh_cache[link_name] is not None:
+            # Has mesh: use add_geometry
+            scene.add_geometry(
+                mesh_cache[link_name],
+                node_name=link_name,
+                parent_node_name=parent_name if parent_name else None,
+                geom_name=link_name + '_geom',
+                transform=node_tf,
+            )
+            geom_count += 1
+        elif link_name in needs_frame:
+            # No mesh but has children: create empty frame
+            scene.graph.update(
+                frame_to=link_name,
+                frame_from=frame_from,
+                matrix=node_tf,
+            )
+        # else: no mesh and no children → skip entirely
+
+        created.add(link_name)
+
+        # Recurse into children
         for cj in children_of.get(link_name, []):
-            child_name = cj['child']
-            child_link = links[child_name]
-            Tj = rpy_to_mat4(cj['rpy'], cj['xyz'])
+            build_node(cj['child'], link_name)
 
-            if child_link['mesh'] is not None and child_link['mesh']['path'] in mesh_cache:
-                mesh_data = mesh_cache[child_link['mesh']['path']]
-                scale = child_link['mesh']['scale']
-                verts = mesh_data['vertices'].copy()
-                verts[:,0] *= scale[0]; verts[:,1] *= scale[1]; verts[:,2] *= scale[2]
-                Tcl = rpy_to_mat4(child_link.get('rpy',[0,0,0]), child_link.get('xyz',[0,0,0]))
-                T = Tj @ Tcl
-                ones = np.ones((len(verts), 1), dtype=np.float32)
-                verts = apply_transform(verts, T)
-                child_idx = builder.add_mesh(verts, mesh_data['faces'], child_name, link_name)
+        return link_name
+
+    build_node(root_link, None)
+
+    print(f"  Scene graph: {geom_count} geometry nodes, "
+          f"{len(scene.graph.transforms.edge_data)} transform edges, "
+          f"{len(needs_frame)} empty frames")
+
+    return scene, joint_for_link
+
+
+# ═══════════════════════════════════════════════════════════════
+# Mesh deduplication: same DAE file → shared trimesh
+# ═══════════════════════════════════════════════════════════════
+
+def build_mesh_cache(links):
+    """
+    Load and transform meshes, deduplicating by (dae_path, vis_xyz, vis_rpy, scale) key.
+    Returns {link_name: transformed_trimesh_or_None}
+    """
+    key_to_mesh = {}
+    mesh_for_link = {}
+
+    for name, link in links.items():
+        if link['mesh_path'] is None:
+            mesh_for_link[name] = None
+            continue
+
+        key = (
+            link['mesh_path'],
+            tuple(round(v, 6) for v in link['vis_xyz']),
+            tuple(round(v, 6) for v in link['vis_rpy']),
+            tuple(round(v, 6) for v in link['scale']),
+        )
+
+        if key not in key_to_mesh:
+            print(f"  Loading {Path(link['mesh_path']).name} for {name}...", end=' ')
+            mesh = load_and_transform_mesh(link)
+            key_to_mesh[key] = mesh
+            if mesh is not None:
+                print(f"{len(mesh.vertices)} verts, {len(mesh.faces)} faces")
             else:
-                child_idx = builder.add_empty_node(child_name)
+                print("SKIP (no mesh data)")
+        else:
+            mesh = key_to_mesh[key]
+            print(f"  Reusing {Path(link['mesh_path']).name} for {name}")
 
-            # Recurse into grandchildren
-            build_link(child_name, link_name)
+        mesh_for_link[name] = key_to_mesh[key]
 
-    build_link(root_link)
-    builder.export(output_path)
+    return mesh_for_link
+
+
+# ═══════════════════════════════════════════════════════════════
+# GLB Export (using trimesh built-in)
+# ═══════════════════════════════════════════════════════════════
+
+def export_glb(scene, output_path, joint_for_link):
+    """Export trimesh Scene to GLB, then annotate with joint metadata."""
+    print(f"\nExporting GLB to {output_path}...")
+
+    # trimesh exports GLTF with node transforms preserved
+    scene.export(output_path, file_type='glb')
+
+    size_mb = os.path.getsize(output_path) / 1e6
+    print(f"  Done: {size_mb:.1f} MB")
+
+    # Verify and report
+    import json, struct
+    with open(output_path, 'rb') as f:
+        data = f.read()
+    json_len = struct.unpack('<I', data[12:16])[0]
+    gltf = json.loads(data[20:20 + json_len])
+
+    nodes_with_mesh = sum(1 for n in gltf['nodes'] if 'mesh' in n)
+    nodes_with_transform = sum(
+        1 for n in gltf['nodes']
+        if any(k in n for k in ['matrix', 'translation', 'rotation', 'scale'])
+    )
+    print(f"  Nodes: {len(gltf['nodes'])} ({nodes_with_mesh} with mesh, "
+          f"{nodes_with_transform} with transform)")
+    print(f"  Meshes: {len(gltf['meshes'])}")
+
+    return gltf
+
+
+# ═══════════════════════════════════════════════════════════════
+# Main
+# ═══════════════════════════════════════════════════════════════
+
+def main():
+    if len(sys.argv) < 2:
+        print(f"Usage: {sys.argv[0]} <urdf_path> [output.glb]")
+        print(f"Example: {sys.argv[0]} models/go1/go1.urdf models/go1/go1.glb")
+        sys.exit(1)
+
+    urdf_path = sys.argv[1]
+    output_path = sys.argv[2] if len(sys.argv) > 2 else str(Path(urdf_path).with_suffix('.glb'))
+
+    print(f"╔══════════════════════════════════════╗")
+    print(f"║   urdf2glb — URDF + DAE → GLB       ║")
+    print(f"╚══════════════════════════════════════╝")
+    print(f"\nURDF: {urdf_path}")
+    print(f"Output: {output_path}\n")
+
+    # 1. Parse URDF
+    print("── Parsing URDF ──")
+    links, joints, root_link = parse_urdf(urdf_path)
+    print(f"  Links: {len(links)}, Joints: {len(joints)}, Root: {root_link}")
+
+    # Count mesh-bearing links
+    mesh_links = sum(1 for l in links.values() if l['mesh_path'])
+    print(f"  Links with meshes: {mesh_links}")
+
+    # Report joints by type
+    revolute = sum(1 for j in joints if j['type'] == 'revolute')
+    fixed = sum(1 for j in joints if j['type'] == 'fixed')
+    print(f"  Revolute joints: {revolute}, Fixed joints: {fixed}")
+
+    # 2. Load and transform meshes (deduped)
+    print("\n── Loading meshes ──")
+    mesh_for_link = build_mesh_cache(links)
+
+    # 3. Build scene graph
+    print("\n── Building scene graph ──")
+    scene, joint_for_link = build_scene_graph(links, joints, root_link, mesh_for_link)
+
+    # 4. Export GLB
+    print("\n── Exporting ──")
+    gltf = export_glb(scene, output_path, joint_for_link)
+
+    # 5. Summary
+    print(f"\n✓ Done! Output: {output_path}")
+
+    # Print the kinematic tree
+    children_of = {}
+    for j in joints:
+        children_of.setdefault(j['parent'], []).append(j)
+
+    def print_tree(name, depth=0):
+        prefix = "  " * depth + ("└─ " if depth > 0 else "")
+        j = joint_for_link.get(name, {})
+        jtype = j.get('type', 'root')
+        axis = j.get('axis', None)
+        axis_str = f" axis=({axis[0]:.1f},{axis[1]:.1f},{axis[2]:.1f})" if axis is not None and jtype == 'revolute' else ""
+        has_mesh = "●" if links[name]['mesh_path'] else "○"
+        print(f"{prefix}{has_mesh} {name} [{jtype}]{axis_str}")
+        for cj in children_of.get(name, []):
+            print_tree(cj['child'], depth + 1)
+
+    print("\nKinematic tree:")
+    print_tree(root_link)
 
 
 if __name__ == '__main__':

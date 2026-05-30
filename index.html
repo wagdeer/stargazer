@@ -22,9 +22,10 @@
 </head>
 <body>
 <div id="hud">
-  <span id="status" class="red">● 连接中...</span><br>
+  <span id="status" class="yellow">● 加载模型中...</span><br>
   轨迹点: <span id="traj-count">0</span><br>
-  点云点数: <span id="pc-count">0</span>
+  点云点数: <span id="pc-count">0</span><br>
+  关节数: <span id="joint-count">0</span>
 </div>
 
 <script type="importmap">
@@ -38,97 +39,213 @@
 <script type="module">
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 
-// ── Scene Setup ──
+// ═══════════════════════════════════════════════════════
+// Scene Setup
+// ═══════════════════════════════════════════════════════
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x0a0a0f);
 scene.fog = new THREE.Fog(0x0a0a0f, 20, 100);
 
 const camera = new THREE.PerspectiveCamera(55, window.innerWidth/window.innerHeight, 0.1, 500);
-camera.position.set(8, 6, 12);
+camera.position.set(5, 4, 8);
 camera.lookAt(0, 0, 0);
 
 const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.shadowMap.enabled = true;
 document.body.appendChild(renderer.domElement);
 
 const controls = new OrbitControls(camera, renderer.domElement);
-controls.target.set(0, 0, 0);
+controls.target.set(0, 0, 0.5);
 controls.update();
 
-// ── Lights ──
-scene.add(new THREE.AmbientLight(0x333344, 3));
-const dirLight = new THREE.DirectionalLight(0xffffff, 2);
+// Lights
+scene.add(new THREE.AmbientLight(0x404060, 4));
+const dirLight = new THREE.DirectionalLight(0xffffff, 3);
 dirLight.position.set(10, 20, 10);
+dirLight.castShadow = true;
 scene.add(dirLight);
+const fillLight = new THREE.DirectionalLight(0x8899cc, 1.5);
+fillLight.position.set(-5, 2, -5);
+scene.add(fillLight);
 
-// ── Grid ──
+// Grid
 const grid = new THREE.GridHelper(40, 40, 0x222233, 0x111122);
 scene.add(grid);
 
-// ── Axis ──
+// Axis
 const axisLen = 2;
-const axisRed   = new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0,0,0), new THREE.Vector3(axisLen,0,0)]), new THREE.LineBasicMaterial({color:0xff3333}));
-const axisGreen = new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0,0,0), new THREE.Vector3(0,axisLen,0)]), new THREE.LineBasicMaterial({color:0x33ff33}));
-const axisBlue  = new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0,0,0), new THREE.Vector3(0,0,axisLen)]), new THREE.LineBasicMaterial({color:0x3366ff}));
-scene.add(axisRed, axisGreen, axisBlue);
+const matR = new THREE.LineBasicMaterial({color: 0xff3333});
+const matG = new THREE.LineBasicMaterial({color: 0x33ff33});
+const matB = new THREE.LineBasicMaterial({color: 0x3366ff});
+scene.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0,0,0), new THREE.Vector3(axisLen,0,0)]), matR));
+scene.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0,0,0), new THREE.Vector3(0,axisLen,0)]), matG));
+scene.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0,0,0), new THREE.Vector3(0,0,axisLen)]), matB));
 
-// ── Trajectory ──
+// Trajectory
 const trajPoints = [];
 const trajGeom = new THREE.BufferGeometry();
-const trajMat = new THREE.PointsMaterial({ color: 0x44ff88, size: 0.08 });
-const trajCloud = new THREE.Points(trajGeom, trajMat);
+const trajCloud = new THREE.Points(trajGeom, new THREE.PointsMaterial({ color: 0x44ff88, size: 0.08 }));
 scene.add(trajCloud);
-
 const trajLineGeom = new THREE.BufferGeometry();
-const trajLine = new THREE.Line(trajLineGeom, new THREE.LineBasicMaterial({ color: 0x44ff88, transparent:true, opacity:0.4 }));
+const trajLine = new THREE.Line(trajLineGeom, new THREE.LineBasicMaterial({ color: 0x44ff88, transparent: true, opacity: 0.4 }));
 scene.add(trajLine);
 
-// ── Point Cloud ──
+// Point Cloud
 const pcGeom = new THREE.BufferGeometry();
-const pcMat = new THREE.PointsMaterial({ color: 0xffaa44, size: 0.04, sizeAttenuation: true });
-const pcCloud = new THREE.Points(pcGeom, pcMat);
+const pcCloud = new THREE.Points(pcGeom, new THREE.PointsMaterial({ color: 0xffaa44, size: 0.04, sizeAttenuation: true }));
 scene.add(pcCloud);
 
-// ── Robot Model (simple box) ──
-const robotGeom = new THREE.BoxGeometry(0.3, 0.2, 0.4);
-const robotMat = new THREE.MeshStandardMaterial({ color: 0x44aaff, metalness: 0.3, roughness: 0.6 });
-const robotMesh = new THREE.Mesh(robotGeom, robotMat);
-scene.add(robotMesh);
-const robotArrow = new THREE.ArrowHelper(new THREE.Vector3(1,0,0), new THREE.Vector3(0,0,0), 0.6, 0x44aaff);
-scene.add(robotArrow);
+// ═══════════════════════════════════════════════════════
+// Robot Model (GLTF)
+// ═══════════════════════════════════════════════════════
+const robotRoot = new THREE.Group();
+// ROS frame → three.js frame: rotate -90° around X
+// ROS: X-fwd, Y-left, Z-up  →  three.js: X-right, Y-up, Z-towards-viewer
+// Equivalent to: (X,Y,Z)_ros → (X, Z, -Y)_three
+robotRoot.rotation.set(-Math.PI/2, 0, 0);
+scene.add(robotRoot);
 
-// ── Render Loop ──
-function animate() {
-  requestAnimationFrame(animate);
-  controls.update();
-  renderer.render(scene, camera);
+const loader = new GLTFLoader();
+let robotModel = null;    // The loaded GLTF scene
+let jointNodes = {};      // name → Object3D for revolute joints
+let baseNode = null;      // 'base' node for applying SLAM pose
+
+// Revivable joint definitions from URDF
+const JOINT_DEFS = {
+  // Hip joints: revolute around X (abduction/adduction)
+  FR_hip: { axis: [1, 0, 0], parent: 'trunk' },
+  FL_hip: { axis: [1, 0, 0], parent: 'trunk' },
+  RR_hip: { axis: [1, 0, 0], parent: 'trunk' },
+  RL_hip: { axis: [1, 0, 0], parent: 'trunk' },
+  // Thigh joints: revolute around Y (hip pitch)
+  FR_thigh: { axis: [0, 1, 0], parent: 'FR_hip' },
+  FL_thigh: { axis: [0, 1, 0], parent: 'FL_hip' },
+  RR_thigh: { axis: [0, 1, 0], parent: 'RR_hip' },
+  RL_thigh: { axis: [0, 1, 0], parent: 'RL_hip' },
+  // Calf joints: revolute around Y (knee)
+  FR_calf: { axis: [0, 1, 0], parent: 'FR_thigh' },
+  FL_calf: { axis: [0, 1, 0], parent: 'FL_thigh' },
+  RR_calf: { axis: [0, 1, 0], parent: 'RR_thigh' },
+  RL_calf: { axis: [0, 1, 0], parent: 'RL_thigh' },
+};
+
+loader.load(
+  'models/go1/go1.glb',
+  (gltf) => {
+    robotModel = gltf.scene;
+    robotRoot.add(robotModel);
+
+    // Extract joint nodes
+    robotModel.traverse((node) => {
+      if (JOINT_DEFS[node.name]) {
+        jointNodes[node.name] = node;
+        // Store the original local matrix for position reference
+        node.userData.restPosition = node.position.clone();
+        node.userData.restQuaternion = node.quaternion.clone();
+      }
+      if (node.name === 'base') {
+        baseNode = node;
+      }
+    });
+
+    const count = Object.keys(jointNodes).length;
+    document.getElementById('joint-count').textContent = count;
+    // Update status — if ROS is already connected, show green
+    const statusEl = document.getElementById('status');
+    if (rosConnected) {
+      statusEl.textContent = '● 已连接';
+      statusEl.className = 'green';
+    } else {
+      statusEl.textContent = '● 模型就绪，等待ROS...';
+      statusEl.className = 'yellow';
+    }
+    console.log(`Robot loaded: ${count} animatable joints`, jointNodes);
+  },
+  (progress) => {
+    const pct = Math.round((progress.loaded / progress.total) * 100);
+    document.getElementById('status').textContent = `● 加载中 ${pct}%...`;
+  },
+  (error) => {
+    console.error('GLB load error:', error);
+    document.getElementById('status').textContent = '● 模型加载失败';
+    document.getElementById('status').className = 'red';
+  }
+);
+
+// ═══════════════════════════════════════════════════════
+// Walking Gait Animation
+// ═══════════════════════════════════════════════════════
+const gait = {
+  time: 0,
+  speed: 4.0,        // gait speed (rad/s)
+  hipAmp: 0.35,      // hip abduction amplitude (rad)
+  thighAmp: 0.6,     // thigh pitch amplitude (rad)
+  calfAmp: 0.8,      // calf pitch amplitude (rad)
+  phaseOffsets: {
+    // Trot gait: diagonal pairs in phase
+    FR_hip: 0,        FR_thigh: 0,        FR_calf: Math.PI / 2,
+    FL_hip: Math.PI,  FL_thigh: Math.PI,  FL_calf: Math.PI + Math.PI / 2,
+    RR_hip: Math.PI,  RR_thigh: Math.PI,  RR_calf: Math.PI + Math.PI / 2,
+    RL_hip: 0,        RL_thigh: 0,        RL_calf: Math.PI / 2,
+  },
+};
+
+function updateGait(dt) {
+  if (Object.keys(jointNodes).length === 0) return;
+  gait.time += dt * gait.speed;
+
+  for (const [name, def] of Object.entries(JOINT_DEFS)) {
+    const node = jointNodes[name];
+    if (!node) continue;
+
+    const phase = gait.phaseOffsets[name] || 0;
+    let amplitude;
+
+    if (name.includes('hip') && !name.includes('thigh')) {
+      amplitude = gait.hipAmp;
+    } else if (name.includes('thigh')) {
+      amplitude = gait.thighAmp;
+    } else if (name.includes('calf')) {
+      amplitude = gait.calfAmp;
+    } else {
+      continue;
+    }
+
+    const angle = Math.sin(gait.time + phase) * amplitude;
+    const [ax, ay, az] = def.axis;
+
+    // Apply rotation around joint axis
+    node.quaternion.copy(node.userData.restQuaternion);
+    const rot = new THREE.Quaternion().setFromAxisAngle(
+      new THREE.Vector3(ax, ay, az), angle
+    );
+    node.quaternion.premultiply(rot);
+  }
 }
-animate();
 
-// ── HUD elements ──
-const statusEl = document.getElementById('status');
-const trajCountEl = document.getElementById('traj-count');
-const pcCountEl = document.getElementById('pc-count');
-
-// ── ROS Bridge ──
-const wsUrl = `ws://${window.location.host}/ws`;
+// ═══════════════════════════════════════════════════════
+// ROS Bridge & Data Handling
+// ═══════════════════════════════════════════════════════
+const wsUrl = `ws://${window.location.hostname}:9090`;
 let rosConnected = false;
+let robotPose = null; // {position: Vector3, quaternion: Quaternion}
 
-function connect() {
+function connectROS() {
   const ws = new WebSocket(wsUrl);
-  
+
   ws.onopen = () => {
     rosConnected = true;
+    const statusEl = document.getElementById('status');
     statusEl.textContent = '● 已连接';
     statusEl.className = 'green';
-    
-    // Subscribe to odometry
+
     ws.send(JSON.stringify({
       op: 'subscribe', topic: '/dlio/odom_node/odom', type: 'nav_msgs/msg/Odometry'
     }));
-    // Subscribe to deskewed point cloud
     ws.send(JSON.stringify({
       op: 'subscribe', topic: '/dlio/odom_node/pointcloud/deskewed', type: 'sensor_msgs/msg/PointCloud2'
     }));
@@ -147,69 +264,62 @@ function connect() {
 
   ws.onclose = () => {
     rosConnected = false;
-    statusEl.textContent = '● 断开，3秒后重连...';
-    statusEl.className = 'red';
-    setTimeout(connect, 3000);
+    document.getElementById('status').textContent = '● 断开，3秒后重连...';
+    document.getElementById('status').className = 'red';
+    setTimeout(connectROS, 3000);
   };
 
   ws.onerror = () => {
-    statusEl.textContent = '● 连接失败';
-    statusEl.className = 'red';
+    document.getElementById('status').textContent = '● 连接失败';
+    document.getElementById('status').className = 'red';
   };
 }
 
-// ── Coordinate conversion: ROS (X-fwd Y-left Z-up) → three.js (X-right Y-up Z-fwd) ──
 function rosToThree(x, y, z) {
+  // ROS (X-fwd, Y-left, Z-up) → three.js (X-right, Y-up, Z-towards-viewer)
   return new THREE.Vector3(x, z, -y);
 }
 
-// ── Odometry Handler ──
-function handleOdometry(msg) {
-  const p = msg.pose.pose.position;
-  const pos = rosToThree(p.x, p.y, p.z);
-  trajPoints.push(pos);
-  
-  // Limit trajectory size
-  if (trajPoints.length > 10000) trajPoints.shift();
-  
-  trajGeom.setFromPoints(trajPoints);
-  trajLineGeom.setFromPoints(trajPoints);
-  trajCountEl.textContent = trajPoints.length;
-  
-  // Move robot model
-  const q = msg.pose.pose.orientation;
-  // ROS quaternion (w,x,y,z) with ROS axes → rotate to three.js frame
-  const rosQ = new THREE.Quaternion(q.x, q.y, q.z, q.w);
-  // Rotate from ROS frame to three.js: X→X, Y→-Z, Z→Y
-  const rot = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1,0,0), -Math.PI/2);
-  robotMesh.position.copy(pos);
-  robotMesh.quaternion.copy(rot).multiply(rosQ);
-  robotArrow.position.copy(pos);
-  const dir = new THREE.Vector3(1, 0, 0).applyQuaternion(robotMesh.quaternion);
-  robotArrow.setDirection(dir);
+function rosQuatToThree(qx, qy, qz, qw) {
+  // ROS orientation in three.js frame
+  return new THREE.Quaternion(qx, qz, -qy, qw);
 }
 
-// ── Point Cloud Handler ──
+function handleOdometry(msg) {
+  const p = msg.pose.pose.position;
+  // Trajectory points: convert to three.js world frame
+  const pos = rosToThree(p.x, p.y, p.z);
+  trajPoints.push(pos);
+  if (trajPoints.length > 10000) trajPoints.shift();
+  trajGeom.setFromPoints(trajPoints);
+  trajLineGeom.setFromPoints(trajPoints);
+  document.getElementById('traj-count').textContent = trajPoints.length;
+
+  // Robot base pose: keep in ROS frame — robotRoot handles the conversion
+  const q = msg.pose.pose.orientation;
+  robotPose = {
+    position: new THREE.Vector3(p.x, p.y, p.z),
+    quaternion: new THREE.Quaternion(q.x, q.y, q.z, q.w),
+  };
+}
+
 function handlePointCloud(msg) {
   if (!msg.data || msg.width === 0) return;
-  
-  // Decode base64 → binary
   const raw = atob(msg.data);
   const bytes = new Uint8Array(raw.length);
   for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
-  
-  // Find x,y,z field offsets
+
   let ox = 0, oy = 0, oz = 0;
   for (const f of msg.fields) {
     if (f.name === 'x') ox = f.offset;
     if (f.name === 'y') oy = f.offset;
     if (f.name === 'z') oz = f.offset;
   }
-  
+
   const view = new DataView(bytes.buffer);
   const pointStep = msg.point_step;
   const points = [];
-  
+
   for (let i = 0; i < msg.width; i++) {
     const off = i * pointStep;
     const rx = view.getFloat32(off + ox, true);
@@ -217,20 +327,44 @@ function handlePointCloud(msg) {
     const rz = view.getFloat32(off + oz, true);
     points.push(rosToThree(rx, ry, rz));
   }
-  
+
   pcGeom.setFromPoints(points);
-  pcCountEl.textContent = points.length;
+  document.getElementById('pc-count').textContent = points.length;
 }
 
-// ── Window Resize ──
+// ═══════════════════════════════════════════════════════
+// Render Loop
+// ═══════════════════════════════════════════════════════
+const clock = new THREE.Clock();
+
+function animate() {
+  requestAnimationFrame(animate);
+  const dt = Math.min(clock.getDelta(), 0.1);
+
+  controls.update();
+
+  // Animate walking gait (always, even without ROS)
+  updateGait(dt);
+
+  // Apply SLAM pose to base node
+  if (robotPose && baseNode) {
+    baseNode.position.copy(robotPose.position);
+    baseNode.quaternion.copy(robotPose.quaternion);
+  }
+
+  renderer.render(scene, camera);
+}
+animate();
+
+// Window resize
 window.addEventListener('resize', () => {
   camera.aspect = window.innerWidth / window.innerHeight;
   camera.updateProjectionMatrix();
   renderer.setSize(window.innerWidth, window.innerHeight);
 });
 
-// ── Start ──
-connect();
+// Start ROS connection
+connectROS();
 </script>
 </body>
 </html>

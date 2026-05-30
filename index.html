@@ -173,10 +173,8 @@ function handleOdometry(msg) {
   trajLineGeom.setFromPoints(trajPoints);
   trajCountEl.textContent = trajPoints.length;
   const q = msg.pose.pose.orientation;
-  const rq = new THREE.Quaternion(q.x,q.y,q.z,q.w);
-  const rot = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1,0,0),-Math.PI/2);
   robotRoot.position.copy(pos);
-  robotRoot.quaternion.copy(rot).multiply(rq);
+  robotRoot.quaternion.set(q.x, q.y, q.z, q.w);
 }
 
 function handlePointCloud(msg) {

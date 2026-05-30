@@ -136,6 +136,15 @@ def rpy_to_mat4(rpy, xyz):
     T[:3, 3] = xyz
     return T
 
+# ROS (X-fwd, Y-left, Z-up) → three.js (X-right, Y-up, Z-towards-viewer)
+ROS2THREE = np.array([[1,0,0],[0,0,-1],[0,1,0]], dtype=np.float32)
+
+def apply_transform(verts, T):
+    """Apply 4x4 T then ROS→three.js coordinate mapping."""
+    ones = np.ones((len(verts), 1), dtype=np.float32)
+    v = (T @ np.hstack([verts, ones]).T).T[:, :3]
+    return v @ ROS2THREE.T
+
 
 # ── GLB Builder ──
 class GLBBuilder:
@@ -367,7 +376,7 @@ def main():
             verts[:,0] *= scale[0]; verts[:,1] *= scale[1]; verts[:,2] *= scale[2]
             T_link = rpy_to_mat4(link.get('rpy',[0,0,0]), link.get('xyz',[0,0,0]))
             ones = np.ones((len(verts), 1), dtype=np.float32)
-            verts = (T_link @ np.hstack([verts, ones]).T).T[:, :3]
+            verts = apply_transform(verts, T_link)
             node_idx = builder.add_mesh(verts, mesh_data['faces'], link_name, parent_node_name)
         else:
             node_idx = builder.add_empty_node(link_name)
@@ -386,7 +395,7 @@ def main():
                 Tcl = rpy_to_mat4(child_link.get('rpy',[0,0,0]), child_link.get('xyz',[0,0,0]))
                 T = Tj @ Tcl
                 ones = np.ones((len(verts), 1), dtype=np.float32)
-                verts = (T @ np.hstack([verts, ones]).T).T[:, :3]
+                verts = apply_transform(verts, T)
                 child_idx = builder.add_mesh(verts, mesh_data['faces'], child_name, link_name)
             else:
                 child_idx = builder.add_empty_node(child_name)

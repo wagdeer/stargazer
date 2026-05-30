@@ -17,6 +17,7 @@
   }
   #hud .green { color: #4f4; }
   #hud .red { color: #f44; }
+  #hud .yellow { color: #fc4; }
 </style>
 </head>
 <body>
@@ -37,15 +38,6 @@
 <script type="module">
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-import { ColladaLoader } from 'three/addons/loaders/ColladaLoader.js';
-
-// ── URDF Loader (CDN) ──
-let URDFLoader;
-try {
-  URDFLoader = (await import('https://cdn.jsdelivr.net/npm/urdf-loader@0.1.0/URDFLoader.js')).default;
-} catch(e) {
-  console.error('URDFLoader load failed:', e);
-}
 
 // ── Scene Setup ──
 const scene = new THREE.Scene();
@@ -65,110 +57,57 @@ const controls = new OrbitControls(camera, renderer.domElement);
 controls.target.set(0, 0, 0);
 controls.update();
 
+// ── Lights ──
 scene.add(new THREE.AmbientLight(0x333344, 3));
 const dirLight = new THREE.DirectionalLight(0xffffff, 2);
 dirLight.position.set(10, 20, 10);
 scene.add(dirLight);
 
+// ── Grid ──
 const grid = new THREE.GridHelper(40, 40, 0x222233, 0x111122);
 scene.add(grid);
 
+// ── Axis ──
 const axisLen = 2;
-scene.add(new THREE.Line(
-  new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0,0,0), new THREE.Vector3(axisLen,0,0)]),
-  new THREE.LineBasicMaterial({color:0xff3333})));
-scene.add(new THREE.Line(
-  new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0,0,0), new THREE.Vector3(0,axisLen,0)]),
-  new THREE.LineBasicMaterial({color:0x33ff33})));
-scene.add(new THREE.Line(
-  new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0,0,0), new THREE.Vector3(0,0,axisLen)]),
-  new THREE.LineBasicMaterial({color:0x3366ff})));
+const axisRed   = new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0,0,0), new THREE.Vector3(axisLen,0,0)]), new THREE.LineBasicMaterial({color:0xff3333}));
+const axisGreen = new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0,0,0), new THREE.Vector3(0,axisLen,0)]), new THREE.LineBasicMaterial({color:0x33ff33}));
+const axisBlue  = new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0,0,0), new THREE.Vector3(0,0,axisLen)]), new THREE.LineBasicMaterial({color:0x3366ff}));
+scene.add(axisRed, axisGreen, axisBlue);
 
+// ── Trajectory ──
 const trajPoints = [];
 const trajGeom = new THREE.BufferGeometry();
-const trajCloud = new THREE.Points(trajGeom, new THREE.PointsMaterial({ color: 0x44ff88, size: 0.08 }));
+const trajMat = new THREE.PointsMaterial({ color: 0x44ff88, size: 0.08 });
+const trajCloud = new THREE.Points(trajGeom, trajMat);
 scene.add(trajCloud);
+
 const trajLineGeom = new THREE.BufferGeometry();
 const trajLine = new THREE.Line(trajLineGeom, new THREE.LineBasicMaterial({ color: 0x44ff88, transparent:true, opacity:0.4 }));
 scene.add(trajLine);
 
+// ── Point Cloud ──
 const pcGeom = new THREE.BufferGeometry();
-const pcCloud = new THREE.Points(pcGeom, new THREE.PointsMaterial({ color: 0xffaa44, size: 0.04, sizeAttenuation: true }));
+const pcMat = new THREE.PointsMaterial({ color: 0xffaa44, size: 0.04, sizeAttenuation: true });
+const pcCloud = new THREE.Points(pcGeom, pcMat);
 scene.add(pcCloud);
 
-// ── Robot URDF Model ──
-const robotRoot = new THREE.Group();
-scene.add(robotRoot);
-let robotModel = null;  // set after URDF loads
-
-// Walking animation state
-let walkPhase = 0;
-const walkSpeed = 8; // rad/s
-
-// Load Go1 URDF
-const loader = new URDFLoader();
-loader.loadMeshCb = (path, manager, done) => {
-  new ColladaLoader(manager).load(path, (collada) => done(collada.scene), null, () => done(null));
-};
-loader.load('./models/go1/go1.urdf', (robot) => {
-  robotModel = robot;
-  // Scale down — URDF is in meters, our scene is small
-  robot.scale.set(0.5, 0.5, 0.5);
-  robotRoot.add(robot);
-  document.getElementById('status').textContent = '● Go1 模型已加载';
-});
-
-// ── Walking animation — drives 12 leg joints with sin/cos ──
-const LEG_JOINTS = [
-  'FR_hip_joint', 'FR_thigh_joint', 'FR_calf_joint',
-  'FL_hip_joint', 'FL_thigh_joint', 'FL_calf_joint',
-  'RR_hip_joint', 'RR_thigh_joint', 'RR_calf_joint',
-  'RL_hip_joint', 'RL_thigh_joint', 'RL_calf_joint',
-];
-
-function animateLegs(dt) {
-  if (!robotModel) return;
-  walkPhase += walkSpeed * dt;
-  const p = walkPhase;
-
-  // Each leg: hip swings, thigh+knee create a trot gait
-  const legs = [
-    { hip: 'FR_hip_joint', thigh: 'FR_thigh_joint', calf: 'FR_calf_joint', phase: 0 },
-    { hip: 'FL_hip_joint', thigh: 'FL_thigh_joint', calf: 'FL_calf_joint', phase: Math.PI },
-    { hip: 'RR_hip_joint', thigh: 'RR_thigh_joint', calf: 'RR_calf_joint', phase: Math.PI },
-    { hip: 'RL_hip_joint', thigh: 'RL_thigh_joint', calf: 'RL_calf_joint', phase: 0 },
-  ];
-
-  for (const leg of legs) {
-    const lp = p + leg.phase;
-    trySetJoint(leg.hip,  0.5 * Math.cos(lp));
-    trySetJoint(leg.thigh, 0.6 * Math.sin(lp));
-    trySetJoint(leg.calf, -0.4 * Math.sin(lp));
-  }
-}
-
-function trySetJoint(name, value) {
-  try {
-    if (robotModel && robotModel.joints[name]) {
-      robotModel.joints[name].setJointValue(value);
-    }
-  } catch(e) {}
-}
+// ── Robot Model (simple box) ──
+const robotGeom = new THREE.BoxGeometry(0.3, 0.2, 0.4);
+const robotMat = new THREE.MeshStandardMaterial({ color: 0x44aaff, metalness: 0.3, roughness: 0.6 });
+const robotMesh = new THREE.Mesh(robotGeom, robotMat);
+scene.add(robotMesh);
+const robotArrow = new THREE.ArrowHelper(new THREE.Vector3(1,0,0), new THREE.Vector3(0,0,0), 0.6, 0x44aaff);
+scene.add(robotArrow);
 
 // ── Render Loop ──
-let lastTime = performance.now();
 function animate() {
   requestAnimationFrame(animate);
-  const now = performance.now();
-  const dt = (now - lastTime) / 1000;
-  lastTime = now;
-  animateLegs(dt);
   controls.update();
   renderer.render(scene, camera);
 }
 animate();
 
-// ── HUD ──
+// ── HUD elements ──
 const statusEl = document.getElementById('status');
 const trajCountEl = document.getElementById('traj-count');
 const pcCountEl = document.getElementById('pc-count');
@@ -179,71 +118,118 @@ let rosConnected = false;
 
 function connect() {
   const ws = new WebSocket(wsUrl);
+  
   ws.onopen = () => {
     rosConnected = true;
-    statusEl.textContent = robotModel ? '● 已连接' : '● Go1 模型已加载';
+    statusEl.textContent = '● 已连接';
     statusEl.className = 'green';
-    ws.send(JSON.stringify({ op: 'subscribe', topic: '/dlio/odom_node/odom', type: 'nav_msgs/msg/Odometry' }));
-    ws.send(JSON.stringify({ op: 'subscribe', topic: '/dlio/odom_node/pointcloud/deskewed', type: 'sensor_msgs/msg/PointCloud2' }));
+    
+    // Subscribe to odometry
+    ws.send(JSON.stringify({
+      op: 'subscribe', topic: '/dlio/odom_node/odom', type: 'nav_msgs/msg/Odometry'
+    }));
+    // Subscribe to deskewed point cloud
+    ws.send(JSON.stringify({
+      op: 'subscribe', topic: '/dlio/odom_node/pointcloud/deskewed', type: 'sensor_msgs/msg/PointCloud2'
+    }));
   };
+
   ws.onmessage = (event) => {
     const msg = JSON.parse(event.data);
-    if (msg.op !== 'publish') return;
-    if (msg.topic === '/dlio/odom_node/odom') handleOdometry(msg.msg);
-    else if (msg.topic === '/dlio/odom_node/pointcloud/deskewed') handlePointCloud(msg.msg);
+    if (msg.op === 'publish') {
+      if (msg.topic === '/dlio/odom_node/odom') {
+        handleOdometry(msg.msg);
+      } else if (msg.topic === '/dlio/odom_node/pointcloud/deskewed') {
+        handlePointCloud(msg.msg);
+      }
+    }
   };
-  ws.onclose = () => { rosConnected = false; statusEl.textContent = '● 断开，3秒后重连...'; statusEl.className = 'red'; setTimeout(connect, 3000); };
-  ws.onerror = () => { statusEl.textContent = '● 连接失败'; statusEl.className = 'red'; };
+
+  ws.onclose = () => {
+    rosConnected = false;
+    statusEl.textContent = '● 断开，3秒后重连...';
+    statusEl.className = 'red';
+    setTimeout(connect, 3000);
+  };
+
+  ws.onerror = () => {
+    statusEl.textContent = '● 连接失败';
+    statusEl.className = 'red';
+  };
 }
 
-// ── Coordinate conversion ──
-function rosToThree(x, y, z) { return new THREE.Vector3(x, z, -y); }
+// ── Coordinate conversion: ROS (X-fwd Y-left Z-up) → three.js (X-right Y-up Z-fwd) ──
+function rosToThree(x, y, z) {
+  return new THREE.Vector3(x, z, -y);
+}
 
 // ── Odometry Handler ──
 function handleOdometry(msg) {
   const p = msg.pose.pose.position;
   const pos = rosToThree(p.x, p.y, p.z);
   trajPoints.push(pos);
+  
+  // Limit trajectory size
   if (trajPoints.length > 10000) trajPoints.shift();
+  
   trajGeom.setFromPoints(trajPoints);
   trajLineGeom.setFromPoints(trajPoints);
   trajCountEl.textContent = trajPoints.length;
-
+  
+  // Move robot model
   const q = msg.pose.pose.orientation;
+  // ROS quaternion (w,x,y,z) with ROS axes → rotate to three.js frame
   const rosQ = new THREE.Quaternion(q.x, q.y, q.z, q.w);
+  // Rotate from ROS frame to three.js: X→X, Y→-Z, Z→Y
   const rot = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1,0,0), -Math.PI/2);
-  robotRoot.position.copy(pos);
-  robotRoot.quaternion.copy(rot).multiply(rosQ);
+  robotMesh.position.copy(pos);
+  robotMesh.quaternion.copy(rot).multiply(rosQ);
+  robotArrow.position.copy(pos);
+  const dir = new THREE.Vector3(1, 0, 0).applyQuaternion(robotMesh.quaternion);
+  robotArrow.setDirection(dir);
 }
 
 // ── Point Cloud Handler ──
 function handlePointCloud(msg) {
   if (!msg.data || msg.width === 0) return;
+  
+  // Decode base64 → binary
   const raw = atob(msg.data);
   const bytes = new Uint8Array(raw.length);
   for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
+  
+  // Find x,y,z field offsets
   let ox = 0, oy = 0, oz = 0;
   for (const f of msg.fields) {
     if (f.name === 'x') ox = f.offset;
     if (f.name === 'y') oy = f.offset;
     if (f.name === 'z') oz = f.offset;
   }
+  
   const view = new DataView(bytes.buffer);
-  const pts = [];
+  const pointStep = msg.point_step;
+  const points = [];
+  
   for (let i = 0; i < msg.width; i++) {
-    const off = i * msg.point_step;
-    pts.push(rosToThree(view.getFloat32(off+ox,true), view.getFloat32(off+oy,true), view.getFloat32(off+oz,true)));
+    const off = i * pointStep;
+    const rx = view.getFloat32(off + ox, true);
+    const ry = view.getFloat32(off + oy, true);
+    const rz = view.getFloat32(off + oz, true);
+    points.push(rosToThree(rx, ry, rz));
   }
-  pcGeom.setFromPoints(pts);
-  pcCountEl.textContent = pts.length;
+  
+  pcGeom.setFromPoints(points);
+  pcCountEl.textContent = points.length;
 }
 
+// ── Window Resize ──
 window.addEventListener('resize', () => {
-  camera.aspect = window.innerWidth/window.innerHeight;
+  camera.aspect = window.innerWidth / window.innerHeight;
   camera.updateProjectionMatrix();
   renderer.setSize(window.innerWidth, window.innerHeight);
 });
 
+// ── Start ──
 connect();
 </script>
 </body>

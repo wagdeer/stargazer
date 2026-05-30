@@ -1,0 +1,184 @@
+# stargazer
+
+实时 3D 网页端机器人集群可视化工具。直接读取 ROS 2 话题，实时渲染轨迹、点云和 URDF 模型 —— 无需写任何前端代码。
+
+基于 [three.js](https://threejs.org) + [rosbridge](https://github.com/RobotWebTools/rosbridge_suite)。默认暗色主题。
+
+![stargazer](https://img.shields.io/badge/技术栈-three.js%20%2B%20rosbridge-blue)
+
+---
+
+## 架构
+
+```
+浏览器（手机/电脑）
+    │
+    ▼ HTTP :8080
+┌──────────────┐      ws://host/ws       ┌──────────────┐
+│   nginx      │ ─────────────────────── │  rosbridge   │
+│  (静态页面 + │                         │  (WebSocket) │
+│   ws 代理)   │                         └──────┬───────┘
+└──────────────┘                                │
+                                          ┌─────┴─────┐
+                                          │  ROS 2     │
+                                          │  topics    │
+                                          └───────────┘
+```
+
+- **nginx** 提供静态页面并代理 WebSocket，单端口搞定，不存在跨域/防火墙问题。
+- **rosbridge** 把 ROS 2 话题通过 WebSocket 桥接到浏览器。
+- **three.js** 纯前端渲染——没有后端状态，没有服务器计算。
+
+---
+
+## 快速开始
+
+### 1. 在你的 ROS 2 环境中启动 rosbridge
+
+```bash
+# 在 ROS 2 容器或宿主机中
+sudo apt install ros-humble-rosbridge-server
+ros2 launch rosbridge_server rosbridge_websocket_launch.xml
+```
+
+rosbridge 默认监听 `ws://localhost:9090`。
+
+### 2. Docker 启动 stargazer
+
+```bash
+docker run -d --name stargazer \
+  -p 8080:8080 \
+  -v $(pwd)/index.html:/usr/share/nginx/html/index.html:ro \
+  -v $(pwd)/nginx.conf:/etc/nginx/nginx.conf:ro \
+  --add-host=host.docker.internal:host-gateway \
+  nginx:alpine
+```
+
+### 3. 打开浏览器
+
+```
+http://localhost:8080
+```
+
+左上角 HUD 显示连接状态。绿色 = 已连接 rosbridge。
+
+---
+
+## ROS 2 话题
+
+stargazer 订阅标准 ROS 2 消息类型。话题名在 `index.html` 里硬编码——修改 `subscribe` 调用即可适配你的系统。
+
+| 话题 | 消息类型 | 显示 |
+|---|---|---|
+| `/dlio/odom_node/odom` | `nav_msgs/Odometry` | 机器人位姿 + 轨迹线 |
+| `/dlio/odom_node/pointcloud/deskewed` | `sensor_msgs/PointCloud2` | 实时点云 |
+
+### 添加自定义话题
+
+编辑 `index.html` 中的 `connect()` 函数：
+
+```js
+ws.send(JSON.stringify({
+  op: 'subscribe',
+  topic: '/你的机器人/odom',
+  type: 'nav_msgs/msg/Odometry'
+}));
+```
+
+然后在 `onmessage` 回调中添加对应处理函数和渲染逻辑。
+
+---
+
+## 坐标系转换
+
+ROS 使用 `X-前, Y-左, Z-上`。three.js 默认 Y 轴朝上。stargazer 做了映射：
+
+```
+three_x =  ros_x
+three_y =  ros_z
+three_z = -ros_y
+```
+
+转换函数在里程计和点云处理函数的顶部——如果你的传感器坐标系不同，改这里就行。
+
+---
+
+## 手机访问（WSL / Windows）
+
+如果你在 WSL 上跑 stargazer，想在手机上查看：
+
+### 1. 配置 Windows 端口转发（一次）
+
+```powershell
+# 在 PowerShell（管理员）中运行
+$wsl_ip = (wsl hostname -I).Trim().Split()[0]
+netsh interface portproxy add v4tov4 listenport=8080 listenaddress=0.0.0.0 connectport=8080 connectaddress=$wsl_ip
+```
+
+### 2. 放行 Windows 防火墙
+
+```powershell
+New-NetFirewallRule -DisplayName "stargazer" -Direction Inbound -Protocol TCP -LocalPort 8080 -Action Allow
+```
+
+### 3. 手机浏览器打开
+
+```
+http://<你电脑的局域网IP>:8080
+```
+
+确保手机和电脑连同一个 WiFi，**关闭 Clash / 代理**——大部分移动端代理会拦截 WebSocket 连接。
+
+---
+
+## 多机器人配置
+
+stargazer 从架构上就是为集群可视化设计的。添加机器人：
+
+1. 订阅每个机器人的命名空间（如 `/robot1/odom`, `/robot2/odom`）
+2. 在渲染函数中给每个机器人分配不同的颜色
+3. 添加标签或模型
+
+示例骨架：
+
+```js
+const robots = {
+  'robot1': { color: 0x44aaff, traj: [], mesh: null },
+  'robot2': { color: 0xff8844, traj: [], mesh: null },
+};
+
+// 在 onmessage 中:
+if (topic.startsWith('/robot1')) robots.robot1.traj.push(...);
+if (topic.startsWith('/robot2')) robots.robot2.traj.push(...);
+```
+
+---
+
+## 自定义
+
+所有渲染逻辑在单个 HTML 文件中。可调的参数：
+
+| 改什么 | 在哪改 |
+|---|---|
+| 话题订阅 | `connect()` 函数 |
+| 坐标系映射 | `rosToThree()` 函数 |
+| 场景颜色/雾/网格 | Scene Setup 区域 |
+| 点云大小 | `pcMat` 的 `size` 属性 |
+| 轨迹颜色/粗细 | `trajMat` 和 `trajLine` 材质 |
+| 机器人模型 | 把 `BoxGeometry` 替换成 GLTF 或 URDF loader |
+
+---
+
+## 依赖
+
+所有前端依赖从 CDN 加载，无需 `npm install`。
+
+- [three.js](https://threejs.org) (v0.160，通过 importmap CDN)
+- [rosbridge_suite](https://github.com/RobotWebTools/rosbridge_suite) (ROS 2 Humble)
+- [nginx:alpine](https://hub.docker.com/_/nginx) (Docker)
+
+---
+
+## 许可证
+
+MIT

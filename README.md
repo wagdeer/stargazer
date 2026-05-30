@@ -1,5 +1,7 @@
 # stargazer
 
+[中文文档](README-zh.md)
+
 Realtime 3D web viewer for robot swarms. Visualizes trajectories, point clouds, and URDF models directly from ROS 2 topics — no frontend code required.
 
 Built on [three.js](https://threejs.org) + [rosbridge](https://github.com/RobotWebTools/rosbridge_suite). Dark by default.

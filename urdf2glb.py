@@ -367,26 +367,19 @@ def build_mesh_cache(links):
             mesh_for_link[name] = None
             continue
 
-        # Rear legs (RR/RL): flip mesh 180° around Y — same DAE as front, different visual
-        is_rear = name.startswith('RR_') or name.startswith('RL_')
-        rear_flip = np.array([
-            [-1, 0, 0, 0],
-            [ 0, 1, 0, 0],
-            [ 0, 0,-1, 0],
-            [ 0, 0, 0, 1],
-        ], dtype=np.float32) if is_rear else None
+
+        mesh_path = link['mesh_path']
 
         key = (
-            link['mesh_path'],
+            mesh_path,
             tuple(round(v, 6) for v in link['vis_xyz']),
             tuple(round(v, 6) for v in link['vis_rpy']),
             tuple(round(v, 6) for v in link['scale']),
-            is_rear,  # rear legs get separate mesh instances
         )
 
         if key not in key_to_mesh:
-            print(f"  Loading {Path(link['mesh_path']).name} for {name}...", end=' ')
-            mesh = load_and_transform_mesh(link, extra_tf=rear_flip)
+            print(f"  Loading {Path(mesh_path).name} for {name}...", end=' ')
+            mesh = load_and_transform_mesh(link)
             key_to_mesh[key] = mesh
             if mesh is not None:
                 print(f"{len(mesh.vertices)} verts, {len(mesh.faces)} faces")

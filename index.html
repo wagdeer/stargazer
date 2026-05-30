@@ -121,7 +121,7 @@ const JOINT_DEFS = {
 };
 
 loader.load(
-  'models/go1/go1.glb',
+  'models/go1/go1.glb?v=' + Date.now(),
   (gltf) => {
     robotModel = gltf.scene;
     robotRoot.add(robotModel);
@@ -157,8 +157,10 @@ loader.load(
 const L1z = 0.213;   // calf joint Z-offset from thigh frame
 const L2  = 0.24;    // calf mesh visual length (hip→foot ≈ 0.29m total)
 
-function solveLegIK(fx, fz) {
+function solveLegIK(fx, fz, branch = 1) {
   // Solve for θ1 (thigh), θ2 (calf)
+  // branch=1 (asin):       thigh<0 calf>0 → front legs (negate both → thigh>0 calf<0)
+  // branch=2 (π - asin):   thigh>0 calf<0 → rear legs (no negation needed)
   const denom = Math.sqrt(fx * fx + fz * fz);
   const K = (L1z * L1z - fx * fx - fz * fz - L2 * L2) / (2 * L2);
 
@@ -169,7 +171,8 @@ function solveLegIK(fx, fz) {
     const phi = Math.atan2(fz, fx);
     let ratio = K / denom;
     ratio = Math.max(-1, Math.min(1, ratio));
-    S = Math.asin(ratio) - phi;
+    const asinVal = Math.asin(ratio);
+    S = (branch === 2) ? (Math.PI - asinVal) - phi : asinVal - phi;
   }
 
   const sinT1 = -(fx + L2 * Math.sin(S)) / L1z;
@@ -261,11 +264,12 @@ const GaitEngine = {
     const result = {};
     const blend = this.standBlend;
 
-    // Standing foot targets: all legs same (rear posture: foot ahead of hip)
-    // Front legs negate IK to get mirrored posture (foot behind hip, thigh forward)
+    // Standing foot targets: all legs use Branch 2 for rear (thigh>0 calf<0).
+    // Front legs negate Branch 1 result (thigh>0 calf<0).
     const standFX = 0.03;
     const standFZ = -0.24;
     const ikStand = solveLegIK(standFX, standFZ);
+    const ikStandRear = solveLegIK(standFX, standFZ, 2);
 
     for (const leg of ['FR', 'FL', 'RR', 'RL']) {
       const { fx, fz } = this.footTarget(leg);
@@ -273,12 +277,19 @@ const GaitEngine = {
       let standThigh = ikStand.thigh;
       let standCalf = ikStand.calf;
 
-      // Front legs: negate both angles → mirrored posture (thigh forward)
       if (this.isFront[leg]) {
+        // Front legs: Branch 1 → negate both
         thigh = -thigh;
         calf = -calf;
         standThigh = -standThigh;
         standCalf = -standCalf;
+      } else {
+        // Rear legs: Branch 2 → thigh>0 (forward) calf<0 (backward)
+        const rearIK = solveLegIK(fx, fz, 2);
+        thigh = rearIK.thigh;
+        calf = rearIK.calf;
+        standThigh = ikStandRear.thigh;
+        standCalf = ikStandRear.calf;
       }
 
       // Blend walking ↔ standing

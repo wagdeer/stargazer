@@ -23,9 +23,9 @@
 <body>
 <div id="hud">
   <span id="status" class="yellow">● 加载模型中...</span><br>
+  速度: <span id="speed">0.00</span> m/s<br>
   轨迹点: <span id="traj-count">0</span><br>
-  点云点数: <span id="pc-count">0</span><br>
-  关节数: <span id="joint-count">0</span>
+  点云点数: <span id="pc-count">0</span>
 </div>
 
 <script type="importmap">
@@ -103,34 +103,21 @@ scene.add(pcCloud);
 // Robot Model (GLTF)
 // ═══════════════════════════════════════════════════════
 const robotRoot = new THREE.Group();
-// ROS frame → three.js frame: rotate -90° around X
-// ROS: X-fwd, Y-left, Z-up  →  three.js: X-right, Y-up, Z-towards-viewer
-// Equivalent to: (X,Y,Z)_ros → (X, Z, -Y)_three
 robotRoot.rotation.set(-Math.PI/2, 0, 0);
 scene.add(robotRoot);
 
 const loader = new GLTFLoader();
-let robotModel = null;    // The loaded GLTF scene
-let jointNodes = {};      // name → Object3D for revolute joints
-let baseNode = null;      // 'base' node for applying SLAM pose
+let robotModel = null;
+let jointNodes = {};
+let baseNode = null;
 
-// Revivable joint definitions from URDF
 const JOINT_DEFS = {
-  // Hip joints: revolute around X (abduction/adduction)
-  FR_hip: { axis: [1, 0, 0], parent: 'trunk' },
-  FL_hip: { axis: [1, 0, 0], parent: 'trunk' },
-  RR_hip: { axis: [1, 0, 0], parent: 'trunk' },
-  RL_hip: { axis: [1, 0, 0], parent: 'trunk' },
-  // Thigh joints: revolute around Y (hip pitch)
-  FR_thigh: { axis: [0, 1, 0], parent: 'FR_hip' },
-  FL_thigh: { axis: [0, 1, 0], parent: 'FL_hip' },
-  RR_thigh: { axis: [0, 1, 0], parent: 'RR_hip' },
-  RL_thigh: { axis: [0, 1, 0], parent: 'RL_hip' },
-  // Calf joints: revolute around Y (knee)
-  FR_calf: { axis: [0, 1, 0], parent: 'FR_thigh' },
-  FL_calf: { axis: [0, 1, 0], parent: 'FL_thigh' },
-  RR_calf: { axis: [0, 1, 0], parent: 'RR_thigh' },
-  RL_calf: { axis: [0, 1, 0], parent: 'RL_thigh' },
+  FR_hip: { axis: [1, 0, 0] }, FL_hip: { axis: [1, 0, 0] },
+  RR_hip: { axis: [1, 0, 0] }, RL_hip: { axis: [1, 0, 0] },
+  FR_thigh: { axis: [0, 1, 0] }, FL_thigh: { axis: [0, 1, 0] },
+  RR_thigh: { axis: [0, 1, 0] }, RL_thigh: { axis: [0, 1, 0] },
+  FR_calf: { axis: [0, 1, 0] }, FL_calf: { axis: [0, 1, 0] },
+  RR_calf: { axis: [0, 1, 0] }, RL_calf: { axis: [0, 1, 0] },
 };
 
 loader.load(
@@ -138,127 +125,261 @@ loader.load(
   (gltf) => {
     robotModel = gltf.scene;
     robotRoot.add(robotModel);
-
-    // Extract joint nodes
     robotModel.traverse((node) => {
       if (JOINT_DEFS[node.name]) {
         jointNodes[node.name] = node;
-        // Store the original local matrix for position reference
         node.userData.restPosition = node.position.clone();
         node.userData.restQuaternion = node.quaternion.clone();
       }
-      if (node.name === 'base') {
-        baseNode = node;
-      }
+      if (node.name === 'base') baseNode = node;
     });
-
-    const count = Object.keys(jointNodes).length;
-    document.getElementById('joint-count').textContent = count;
-    // Update status — if ROS is already connected, show green
     const statusEl = document.getElementById('status');
-    if (rosConnected) {
-      statusEl.textContent = '● 已连接';
-      statusEl.className = 'green';
-    } else {
-      statusEl.textContent = '● 模型就绪，等待ROS...';
-      statusEl.className = 'yellow';
-    }
-    console.log(`Robot loaded: ${count} animatable joints`, jointNodes);
+    if (rosConnected) { statusEl.textContent = '● 已连接'; statusEl.className = 'green'; }
+    else { statusEl.textContent = '● 模型就绪，等待ROS...'; statusEl.className = 'yellow'; }
   },
-  (progress) => {
-    const pct = Math.round((progress.loaded / progress.total) * 100);
-    document.getElementById('status').textContent = `● 加载中 ${pct}%...`;
-  },
-  (error) => {
-    console.error('GLB load error:', error);
-    document.getElementById('status').textContent = '● 模型加载失败';
-    document.getElementById('status').className = 'red';
-  }
+  (p) => { document.getElementById('status').textContent = `● 加载中 ${Math.round(p.loaded/p.total*100)}%...`; },
+  (e) => { console.error(e); document.getElementById('status').textContent = '● 加载失败'; document.getElementById('status').className = 'red'; }
 );
 
 // ═══════════════════════════════════════════════════════
-// Walking Gait Animation
+// Leg IK — 2-DOF planar solver (thigh + calf, both Y-axis)
 // ═══════════════════════════════════════════════════════
-const gait = {
-  time: 0,
-  speed: 4.0,        // gait speed (rad/s)
-  hipAmp: 0.35,      // hip abduction amplitude (rad)
-  thighAmp: 0.6,     // thigh pitch amplitude (rad)
-  calfAmp: 0.8,      // calf pitch amplitude (rad)
-  phaseOffsets: {
-    // Trot gait: diagonal pairs in phase
-    FR_hip: 0,        FR_thigh: 0,        FR_calf: Math.PI / 2,
-    FL_hip: Math.PI,  FL_thigh: Math.PI,  FL_calf: Math.PI + Math.PI / 2,
-    RR_hip: Math.PI,  RR_thigh: Math.PI,  RR_calf: Math.PI + Math.PI / 2,
-    RL_hip: 0,        RL_thigh: 0,        RL_calf: Math.PI / 2,
+const LEG = {
+  L1: 0.08,    // thigh segment (hip→knee), meters
+  L2: 0.25,    // calf segment (knee→foot), meters
+
+  // Standing pose joint angles (radians)
+  stand: {
+    thigh: 0.35,
+    calf: -2.0,
+  },
+
+  // Joint limits from URDF
+  limits: {
+    thigh: [-0.686, 4.501],
+    calf: [-2.818, -0.888],
+  },
+
+  /**
+   * Solve 2-DOF planar IK.
+   * @param {number} fx - target X in hip frame (forward, ROS)
+   * @param {number} fz - target Z in hip frame (up, ROS)
+   * @returns {{thigh: number, calf: number}} joint angles in radians
+   */
+  solve(fx, fz) {
+    const { L1, L2 } = this;
+    const d2 = fx * fx + fz * fz;
+    const d = Math.sqrt(Math.max(d2, 1e-8));
+
+    // Clamp reach
+    const dClamp = Math.min(Math.max(d, Math.abs(L1 - L2) + 0.001), L1 + L2 - 0.001);
+
+    // cos(θ2) from law of cosines
+    let cos2 = (dClamp * dClamp - L1 * L1 - L2 * L2) / (2 * L1 * L2);
+    cos2 = Math.max(-1, Math.min(1, cos2));
+
+    // Calf always bent backward (negative angle)
+    const calf = -Math.acos(cos2);
+
+    // θ1 = atan2(fz_down, fx) - atan2(L2·sin(θ2), L1 + L2·cos(θ2))
+    // fz_down = -fz  (positive = downward from hip)
+    const thigh = Math.atan2(-fz, fx) - Math.atan2(L2 * Math.sin(calf), L1 + L2 * Math.cos(calf));
+
+    // Clamp to joint limits
+    return {
+      thigh: Math.max(this.limits.thigh[0], Math.min(this.limits.thigh[1], thigh)),
+      calf: Math.max(this.limits.calf[0], Math.min(this.limits.calf[1], calf)),
+    };
+  },
+
+  /**
+   * Forward kinematics. @returns {{fx: number, fz: number}}
+   */
+  fk(thigh, calf) {
+    const fx = this.L1 * Math.sin(thigh) + this.L2 * Math.sin(thigh + calf);
+    const fz = -(this.L1 * Math.cos(thigh) + this.L2 * Math.cos(thigh + calf));
+    return { fx, fz };
   },
 };
 
-function updateGait(dt) {
-  if (Object.keys(jointNodes).length === 0) return;
-  gait.time += dt * gait.speed;
 
-  for (const [name, def] of Object.entries(JOINT_DEFS)) {
-    const node = jointNodes[name];
-    if (!node) continue;
+// ═══════════════════════════════════════════════════════
+// Gait Engine — velocity-driven foot trajectory + IK
+// ═══════════════════════════════════════════════════════
+const GaitEngine = {
+  phase: { FR: 0, FL: 0, RR: 0, RL: 0 },  // per-leg gait phase [0, 1)
+  speed: 0,        // current robot speed (m/s)
+  stepLength: 0.08, // current step length (m)
 
-    const phase = gait.phaseOffsets[name] || 0;
-    let amplitude;
+  // Parameters
+  baseStepLength: 0.04,   // step at minimum speed
+  maxStepLength: 0.14,    // step at max speed
+  stanceRatio: 0.55,      // fraction of cycle in stance
+  liftHeight: 0.06,       // foot lift during swing (m)
+  standHeight: -0.28,     // nominal foot Z when standing
+  speedGain: 2.5,         // speed → phase rate multiplier
+  deadband: 0.02,         // below this speed, stand still
+  bodySwayAmp: 0.015,     // body lateral sway (m)
 
-    if (name.includes('hip') && !name.includes('thigh')) {
-      amplitude = gait.hipAmp;
-    } else if (name.includes('thigh')) {
-      amplitude = gait.thighAmp;
-    } else if (name.includes('calf')) {
-      amplitude = gait.calfAmp;
-    } else {
-      continue;
+  // Trot gait: diagonal pairs have same phase offset
+  offsets: {
+    FR: 0.0, FL: 0.5,
+    RR: 0.5, RL: 0.0,
+  },
+
+  // Blend factor toward standing pose (0 = walking, 1 = standing)
+  standBlend: 0,
+
+  /**
+   * Update gait state.
+   * @param {number} dt - delta time (seconds)
+   * @param {number} vx - robot forward velocity (m/s, ROS X)
+   */
+  update(dt, vx) {
+    const absV = Math.abs(vx);
+
+    // Transition to standing if slow
+    if (absV < this.deadband) {
+      this.standBlend = Math.min(1, this.standBlend + dt * 4);
+      // Still tick phase slowly so legs return smoothly when moving again
+      for (const leg of ['FR','FL','RR','RL']) {
+        this.phase[leg] = (this.phase[leg] + dt * 0.3) % 1;
+      }
+      this.speed = 0;
+      this.stepLength = this.baseStepLength;
+      return;
     }
 
-    const angle = Math.sin(gait.time + phase) * amplitude;
-    const [ax, ay, az] = def.axis;
+    // Walking: advance phase proportional to speed
+    this.standBlend = Math.max(0, this.standBlend - dt * 4);
+    this.speed = absV;
+    this.stepLength = this.baseStepLength + (this.maxStepLength - this.baseStepLength) * Math.min(absV / 1.5, 1.0);
 
-    // Apply rotation around joint axis
-    node.quaternion.copy(node.userData.restQuaternion);
-    const rot = new THREE.Quaternion().setFromAxisAngle(
-      new THREE.Vector3(ax, ay, az), angle
-    );
-    node.quaternion.premultiply(rot);
+    const phaseRate = absV * this.speedGain;
+    for (const leg of ['FR','FL','RR','RL']) {
+      this.phase[leg] = (this.phase[leg] + dt * phaseRate) % 1;
+    }
+  },
+
+  /**
+   * Get desired foot position in hip frame for one leg.
+   * @param {string} leg - 'FR', 'FL', 'RR', 'RL'
+   * @returns {{fx: number, fz: number}}
+   */
+  footTarget(leg) {
+    let phase = (this.phase[leg] + this.offsets[leg]) % 1;
+    const sl = this.stepLength;
+
+    let fx, fz;
+    if (phase < this.stanceRatio) {
+      // Stance: foot on ground, push backward
+      const s = phase / this.stanceRatio;
+      fx = sl * (0.5 - s);        // +sl/2 → -sl/2
+      fz = this.standHeight;
+    } else {
+      // Swing: foot lifts, swings forward
+      const s = (phase - this.stanceRatio) / (1 - this.stanceRatio);
+      fx = -sl * 0.5 + sl * s;    // -sl/2 → +sl/2
+      fz = this.standHeight + this.liftHeight * Math.sin(Math.PI * s);
+    }
+
+    return { fx, fz };
+  },
+
+  /**
+   * Compute joint angles for all legs.
+   * @returns {Object} leg→{hip, thigh, calf} in radians
+   */
+  computeJoints() {
+    const result = {};
+    const { stand } = LEG;
+
+    for (const leg of ['FR', 'FL', 'RR', 'RL']) {
+      // Walking target
+      const { fx, fz } = this.footTarget(leg);
+      const ikWalk = LEG.solve(fx, fz);
+
+      // Blend toward standing
+      const blend = this.standBlend;
+      const thigh = ikWalk.thigh * (1 - blend) + stand.thigh * blend;
+      const calf = ikWalk.calf * (1 - blend) + stand.calf * blend;
+
+      // Hip abduction: small oscillation for balance
+      const hipPhase = (this.phase[leg] + this.offsets[leg]) % 1;
+      const hipWalk = 0.08 * Math.sin(hipPhase * Math.PI * 2);  // small lateral
+      const hip = hipWalk * (1 - blend);
+
+      result[leg] = { hip, thigh, calf };
+    }
+    return result;
+  },
+};
+
+
+// ═══════════════════════════════════════════════════════
+// Apply gait to GLTF nodes
+// ═══════════════════════════════════════════════════════
+function applyGait(joints) {
+  for (const [leg, angles] of Object.entries(joints)) {
+    const hipNode = jointNodes[leg + '_hip'];
+    const thighNode = jointNodes[leg + '_thigh'];
+    const calfNode = jointNodes[leg + '_calf'];
+
+    // Hip abduction (X rotation)
+    if (hipNode) {
+      hipNode.quaternion.copy(hipNode.userData.restQuaternion);
+      const rot = new THREE.Quaternion().setFromAxisAngle(
+        new THREE.Vector3(1, 0, 0), angles.hip
+      );
+      hipNode.quaternion.premultiply(rot);
+    }
+
+    // Thigh pitch (Y rotation)
+    if (thighNode) {
+      thighNode.quaternion.copy(thighNode.userData.restQuaternion);
+      const rot = new THREE.Quaternion().setFromAxisAngle(
+        new THREE.Vector3(0, 1, 0), angles.thigh
+      );
+      thighNode.quaternion.premultiply(rot);
+    }
+
+    // Calf (knee, Y rotation)
+    if (calfNode) {
+      calfNode.quaternion.copy(calfNode.userData.restQuaternion);
+      const rot = new THREE.Quaternion().setFromAxisAngle(
+        new THREE.Vector3(0, 1, 0), angles.calf
+      );
+      calfNode.quaternion.premultiply(rot);
+    }
   }
 }
+
 
 // ═══════════════════════════════════════════════════════
 // ROS Bridge & Data Handling
 // ═══════════════════════════════════════════════════════
 const wsUrl = `ws://${window.location.hostname}:9090`;
 let rosConnected = false;
-let robotPose = null; // {position: Vector3, quaternion: Quaternion}
+let robotPose = null;
+let robotVelocity = 0;  // m/s, ROS X (forward)
 
 function connectROS() {
   const ws = new WebSocket(wsUrl);
 
   ws.onopen = () => {
     rosConnected = true;
-    const statusEl = document.getElementById('status');
-    statusEl.textContent = '● 已连接';
-    statusEl.className = 'green';
-
-    ws.send(JSON.stringify({
-      op: 'subscribe', topic: '/dlio/odom_node/odom', type: 'nav_msgs/msg/Odometry'
-    }));
-    ws.send(JSON.stringify({
-      op: 'subscribe', topic: '/dlio/odom_node/pointcloud/deskewed', type: 'sensor_msgs/msg/PointCloud2'
-    }));
+    const s = document.getElementById('status');
+    s.textContent = '● 已连接';
+    s.className = 'green';
+    ws.send(JSON.stringify({ op: 'subscribe', topic: '/dlio/odom_node/odom', type: 'nav_msgs/msg/Odometry' }));
+    ws.send(JSON.stringify({ op: 'subscribe', topic: '/dlio/odom_node/pointcloud/deskewed', type: 'sensor_msgs/msg/PointCloud2' }));
   };
 
   ws.onmessage = (event) => {
     const msg = JSON.parse(event.data);
     if (msg.op === 'publish') {
-      if (msg.topic === '/dlio/odom_node/odom') {
-        handleOdometry(msg.msg);
-      } else if (msg.topic === '/dlio/odom_node/pointcloud/deskewed') {
-        handlePointCloud(msg.msg);
-      }
+      if (msg.topic === '/dlio/odom_node/odom') handleOdometry(msg.msg);
+      else if (msg.topic === '/dlio/odom_node/pointcloud/deskewed') handlePointCloud(msg.msg);
     }
   };
 
@@ -268,7 +389,6 @@ function connectROS() {
     document.getElementById('status').className = 'red';
     setTimeout(connectROS, 3000);
   };
-
   ws.onerror = () => {
     document.getElementById('status').textContent = '● 连接失败';
     document.getElementById('status').className = 'red';
@@ -276,18 +396,11 @@ function connectROS() {
 }
 
 function rosToThree(x, y, z) {
-  // ROS (X-fwd, Y-left, Z-up) → three.js (X-right, Y-up, Z-towards-viewer)
   return new THREE.Vector3(x, z, -y);
-}
-
-function rosQuatToThree(qx, qy, qz, qw) {
-  // ROS orientation in three.js frame
-  return new THREE.Quaternion(qx, qz, -qy, qw);
 }
 
 function handleOdometry(msg) {
   const p = msg.pose.pose.position;
-  // Trajectory points: convert to three.js world frame
   const pos = rosToThree(p.x, p.y, p.z);
   trajPoints.push(pos);
   if (trajPoints.length > 10000) trajPoints.shift();
@@ -295,12 +408,16 @@ function handleOdometry(msg) {
   trajLineGeom.setFromPoints(trajPoints);
   document.getElementById('traj-count').textContent = trajPoints.length;
 
-  // Robot base pose: keep in ROS frame — robotRoot handles the conversion
   const q = msg.pose.pose.orientation;
   robotPose = {
     position: new THREE.Vector3(p.x, p.y, p.z),
     quaternion: new THREE.Quaternion(q.x, q.y, q.z, q.w),
   };
+
+  // Extract forward velocity (ROS X = forward)
+  const vx = msg.twist?.twist?.linear?.x || 0;
+  robotVelocity = vx;
+  document.getElementById('speed').textContent = vx.toFixed(2);
 }
 
 function handlePointCloud(msg) {
@@ -317,17 +434,15 @@ function handlePointCloud(msg) {
   }
 
   const view = new DataView(bytes.buffer);
-  const pointStep = msg.point_step;
   const points = [];
-
   for (let i = 0; i < msg.width; i++) {
-    const off = i * pointStep;
-    const rx = view.getFloat32(off + ox, true);
-    const ry = view.getFloat32(off + oy, true);
-    const rz = view.getFloat32(off + oz, true);
-    points.push(rosToThree(rx, ry, rz));
+    const off = i * msg.point_step;
+    points.push(rosToThree(
+      view.getFloat32(off + ox, true),
+      view.getFloat32(off + oy, true),
+      view.getFloat32(off + oz, true)
+    ));
   }
-
   pcGeom.setFromPoints(points);
   document.getElementById('pc-count').textContent = points.length;
 }
@@ -343,8 +458,14 @@ function animate() {
 
   controls.update();
 
-  // Animate walking gait (always, even without ROS)
-  updateGait(dt);
+  // Update gait engine from odometry velocity
+  GaitEngine.update(dt, robotVelocity);
+
+  // Compute and apply joint angles
+  if (Object.keys(jointNodes).length > 0) {
+    const joints = GaitEngine.computeJoints();
+    applyGait(joints);
+  }
 
   // Apply SLAM pose to base node
   if (robotPose && baseNode) {
@@ -356,14 +477,12 @@ function animate() {
 }
 animate();
 
-// Window resize
 window.addEventListener('resize', () => {
   camera.aspect = window.innerWidth / window.innerHeight;
   camera.updateProjectionMatrix();
   renderer.setSize(window.innerWidth, window.innerHeight);
 });
 
-// Start ROS connection
 connectROS();
 </script>
 </body>

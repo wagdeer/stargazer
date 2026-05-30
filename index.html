@@ -25,7 +25,8 @@
   <span id="status" class="yellow">● 加载模型中...</span><br>
   速度: <span id="speed">0.00</span> m/s<br>
   轨迹点: <span id="traj-count">0</span><br>
-  点云点数: <span id="pc-count">0</span>
+  点云点数: <span id="pc-count">0</span><br>
+  <span id="cam-mode" style="font-size:11px;color:#999">V: 第三人称</span>
 </div>
 
 <script type="importmap">
@@ -468,10 +469,38 @@ function handlePointCloud(msg) {
 // Render Loop
 // ═══════════════════════════════════════════════════════
 const clock = new THREE.Clock();
+let thirdPerson = false;
+const camModeEl = document.getElementById('cam-mode');
+
+window.addEventListener('keydown', (e) => {
+  if (e.key === 'v' || e.key === 'V') {
+    thirdPerson = !thirdPerson;
+    camModeEl.textContent = thirdPerson ? 'V: 自由视角' : 'V: 第三人称';
+    camModeEl.style.color = thirdPerson ? '#cc6b3d' : '#999';
+    if (!thirdPerson) controls.target.set(0, 0, 0.5);
+  }
+});
 
 function animate() {
   requestAnimationFrame(animate);
   const dt = Math.min(clock.getDelta(), 0.1);
+
+  // Third-person: camera stays behind robot, smooth follow
+  if (thirdPerson && robotPose) {
+    const target = rosToThree(robotPose.position.x, robotPose.position.y, robotPose.position.z);
+    controls.target.lerp(target, 0.1);
+
+    // Robot forward in world: ROS +X → apply quaternion → rotate -90° X
+    const fwd = new THREE.Vector3(1, 0, 0);
+    fwd.applyQuaternion(robotPose.quaternion);
+    fwd.applyAxisAngle(new THREE.Vector3(1, 0, 0), -Math.PI / 2);
+
+    const behind = target.clone()
+      .addScaledVector(fwd, -5)           // 5m behind robot
+      .add(new THREE.Vector3(0, 3, 0));   // 3m above
+    camera.position.lerp(behind, 0.08);
+    camera.lookAt(target);
+  }
 
   controls.update();
 

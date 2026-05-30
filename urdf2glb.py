@@ -151,6 +151,11 @@ class GLBBuilder:
 
     def add_mesh(self, vertices, faces, node_name, parent_name=None):
         """Add a mesh primitive and create a node for it."""
+        if node_name in self.node_index:
+            # Node already exists — just set parent
+            if parent_name:
+                self.set_parent(node_name, parent_name)
+            return self.node_index[node_name]
         verts = vertices.astype(np.float32)
         indices = faces.astype(np.uint32)
         verts_bytes = verts.tobytes()
@@ -221,6 +226,8 @@ class GLBBuilder:
         return ni
 
     def add_empty_node(self, name):
+        if name in self.node_index:
+            return self.node_index[name]
         ni = len(self.nodes)
         self.nodes.append({'name': name})
         self.node_index[name] = ni
@@ -228,9 +235,7 @@ class GLBBuilder:
 
     def add_node(self, name):
         """Alias: ensure node exists (no mesh)."""
-        if name not in self.node_index:
-            return self.add_empty_node(name)
-        return self.node_index[name]
+        return self.add_empty_node(name)
 
     def set_parent(self, child_name, parent_name):
         ci = self.node_index[child_name]
@@ -335,12 +340,8 @@ def main():
         else:
             print(f"    WARN: failed to parse")
 
-    # Build GLB
+    # Build GLB — single pass, recursive tree walk
     builder = GLBBuilder()
-
-    # First pass: create nodes for all links
-    for name in links:
-        builder.add_node(name)
 
     # Find root (link not a child of any joint)
     all_children = {j['child'] for j in joints}
@@ -350,49 +351,50 @@ def main():
             root_link = name
             break
 
-    # Second pass: add meshes and set transforms
+    # Build children map for joints
+    children_of = {}
     for j in joints:
-        parent = j['parent']
-        child = j['child']
-        child_link = links[child]
+        children_of.setdefault(j['parent'], []).append(j)
 
-        # Compute transform: joint origin → child link origin
-        Tj = rpy_to_mat4(j['rpy'], j['xyz'])
-        Tcl = rpy_to_mat4(child_link.get('rpy', [0,0,0]), child_link.get('xyz', [0,0,0]))
-        T = Tj @ Tcl
+    def build_link(link_name, parent_node_name=None):
+        """Recursively add a link and its children to the GLB."""
+        link = links[link_name]
 
-        if child_link['mesh'] is not None:
-            mesh_path = child_link['mesh']['path']
-            scale = child_link['mesh']['scale']
-            mesh_data = mesh_cache.get(mesh_path)
-            if mesh_data is not None and len(mesh_data['vertices']) > 0:
-                verts = mesh_data['vertices'].copy()
-                # Apply scale
-                verts[:, 0] *= scale[0]
-                verts[:, 1] *= scale[1]
-                verts[:, 2] *= scale[2]
-                # Apply transform
-                ones = np.ones((len(verts), 1), dtype=np.float32)
-                verts_h = np.hstack([verts, ones])
-                verts_t = (T @ verts_h.T).T[:, :3]
-                builder.add_mesh(verts_t, mesh_data['faces'], child, parent)
-            else:
-                builder.add_empty_node(child)
-        else:
-            builder.add_empty_node(child)
-
-    # Add mesh for root link
-    if root_link and links[root_link]['mesh'] is not None:
-        mesh_data = mesh_cache.get(links[root_link]['mesh']['path'])
-        if mesh_data is not None:
+        if link['mesh'] is not None and link['mesh']['path'] in mesh_cache:
+            mesh_data = mesh_cache[link['mesh']['path']]
+            scale = link['mesh']['scale']
             verts = mesh_data['vertices'].copy()
-            scale = links[root_link]['mesh']['scale']
-            verts[:, 0] *= scale[0]; verts[:, 1] *= scale[1]; verts[:, 2] *= scale[2]
-            T_root = rpy_to_mat4(links[root_link]['rpy'], links[root_link]['xyz'])
+            verts[:,0] *= scale[0]; verts[:,1] *= scale[1]; verts[:,2] *= scale[2]
+            T_link = rpy_to_mat4(link.get('rpy',[0,0,0]), link.get('xyz',[0,0,0]))
             ones = np.ones((len(verts), 1), dtype=np.float32)
-            verts = (T_root @ np.hstack([verts, ones]).T).T[:, :3]
-            builder.add_mesh(verts, mesh_data['faces'], root_link)
+            verts = (T_link @ np.hstack([verts, ones]).T).T[:, :3]
+            node_idx = builder.add_mesh(verts, mesh_data['faces'], link_name, parent_node_name)
+        else:
+            node_idx = builder.add_empty_node(link_name)
 
+        # Process child joints: apply joint transform to child link's mesh
+        for cj in children_of.get(link_name, []):
+            child_name = cj['child']
+            child_link = links[child_name]
+            Tj = rpy_to_mat4(cj['rpy'], cj['xyz'])
+
+            if child_link['mesh'] is not None and child_link['mesh']['path'] in mesh_cache:
+                mesh_data = mesh_cache[child_link['mesh']['path']]
+                scale = child_link['mesh']['scale']
+                verts = mesh_data['vertices'].copy()
+                verts[:,0] *= scale[0]; verts[:,1] *= scale[1]; verts[:,2] *= scale[2]
+                Tcl = rpy_to_mat4(child_link.get('rpy',[0,0,0]), child_link.get('xyz',[0,0,0]))
+                T = Tj @ Tcl
+                ones = np.ones((len(verts), 1), dtype=np.float32)
+                verts = (T @ np.hstack([verts, ones]).T).T[:, :3]
+                child_idx = builder.add_mesh(verts, mesh_data['faces'], child_name, link_name)
+            else:
+                child_idx = builder.add_empty_node(child_name)
+
+            # Recurse into grandchildren
+            build_link(child_name, link_name)
+
+    build_link(root_link)
     builder.export(output_path)
 
 

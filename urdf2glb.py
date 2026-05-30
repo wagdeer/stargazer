@@ -236,7 +236,7 @@ def load_and_transform_mesh(link_info: dict, extra_tf: np.ndarray = None) -> tri
     # 4) Combined transform: DAE_scene_tf first, then visual_origin on top
     combined_tf = vis_tf @ dae_scene_tf
 
-    # 5) Apply extra transform (e.g. rear leg 180° Y flip)
+    # 5) Apply extra transform if provided
     if extra_tf is not None and not np.allclose(extra_tf, np.eye(4)):
         combined_tf = extra_tf @ combined_tf
 
@@ -366,7 +366,6 @@ def build_mesh_cache(links):
         if link['mesh_path'] is None:
             mesh_for_link[name] = None
             continue
-
 
         mesh_path = link['mesh_path']
 

@@ -117,7 +117,6 @@ robotRoot.rotation.set(-Math.PI/2, 0, 0);
 scene.add(robotRoot);
 
 const loader = new GLTFLoader();
-let robotModel = null;
 let jointNodes = {};
 let baseNode = null;
 
@@ -133,7 +132,7 @@ const JOINT_DEFS = {
 loader.load(
   'models/go1/go1.glb?v=' + Date.now(),
   (gltf) => {
-    robotModel = gltf.scene;
+    const robotModel = gltf.scene;
     robotRoot.add(robotModel);
 
     // Extract joint nodes
@@ -224,8 +223,7 @@ const GaitEngine = {
     RR: 0.5, RL: 0.0,
   },
 
-  // Front legs mirror: negate IK result (thigh forward, foot mirrored in X)
-  // All legs share the same foot trajectory (ahead→behind during stance)
+  // Leg classification: front legs use Branch 1 + negation, rear use Branch 2
   isFront: {
     FR: true, FL: true,
     RR: false, RL: false,
@@ -274,30 +272,25 @@ const GaitEngine = {
     const result = {};
     const blend = this.standBlend;
 
-    // Standing foot targets: all legs use Branch 2 for rear (thigh>0 calf<0).
-    // Front legs negate Branch 1 result (thigh>0 calf<0).
     const standFX = 0.03;
     const standFZ = -0.24;
-    const ikStand = solveLegIK(standFX, standFZ);
-    const ikStandRear = solveLegIK(standFX, standFZ, 2);
+    const ikStand = solveLegIK(standFX, standFZ);      // Branch 1 → for front (negated)
+    const ikStandRear = solveLegIK(standFX, standFZ, 2); // Branch 2 → for rear
 
     for (const leg of ['FR', 'FL', 'RR', 'RL']) {
       const { fx, fz } = this.footTarget(leg);
-      let { thigh, calf } = solveLegIK(fx, fz);
-      let standThigh = ikStand.thigh;
-      let standCalf = ikStand.calf;
 
+      let thigh, calf, standThigh, standCalf;
       if (this.isFront[leg]) {
-        // Front legs: Branch 1 → negate both
-        thigh = -thigh;
-        calf = -calf;
-        standThigh = -standThigh;
-        standCalf = -standCalf;
+        const ik = solveLegIK(fx, fz);
+        thigh = -ik.thigh;
+        calf = -ik.calf;
+        standThigh = -ikStand.thigh;
+        standCalf = -ikStand.calf;
       } else {
-        // Rear legs: Branch 2 → thigh>0 (forward) calf<0 (backward)
-        const rearIK = solveLegIK(fx, fz, 2);
-        thigh = rearIK.thigh;
-        calf = rearIK.calf;
+        const ik = solveLegIK(fx, fz, 2);
+        thigh = ik.thigh;
+        calf = ik.calf;
         standThigh = ikStandRear.thigh;
         standCalf = ikStandRear.calf;
       }
@@ -440,7 +433,6 @@ function handlePointCloud(msg) {
   }
 
   const view = new DataView(bytes.buffer);
-  let added = 0;
 
   for (let i = 0; i < msg.width; i++) {
     const off = i * msg.point_step;
@@ -459,7 +451,6 @@ function handlePointCloud(msg) {
     pcVoxelMap.set(key, true);
 
     pcAccum.push(pt);
-    added++;
   }
 
   // Cap accumulated points at 2M

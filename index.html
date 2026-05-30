@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DLIO Multi-Robot Viewer</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #0a0a0f; overflow: hidden; font-family: 'Segoe UI', sans-serif; }
+  canvas { display: block; }
+  #hud {
+    position: fixed; top: 12px; left: 12px;
+    color: #888; font-size: 13px;
+    background: rgba(10,10,15,0.85);
+    padding: 8px 14px; border-radius: 6px;
+    border: 1px solid #222;
+  }
+  #hud .green { color: #4f4; }
+  #hud .red { color: #f44; }
+  #hud .yellow { color: #fc4; }
+</style>
+</head>
+<body>
+<div id="hud">
+  <span id="status" class="red">● 连接中...</span><br>
+  轨迹点: <span id="traj-count">0</span><br>
+  点云点数: <span id="pc-count">0</span>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+// ── Scene Setup ──
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0a0a0f);
+scene.fog = new THREE.Fog(0x0a0a0f, 20, 100);
+
+const camera = new THREE.PerspectiveCamera(55, window.innerWidth/window.innerHeight, 0.1, 500);
+camera.position.set(8, 6, 12);
+camera.lookAt(0, 0, 0);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+document.body.appendChild(renderer.domElement);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 0, 0);
+controls.update();
+
+// ── Lights ──
+scene.add(new THREE.AmbientLight(0x333344, 3));
+const dirLight = new THREE.DirectionalLight(0xffffff, 2);
+dirLight.position.set(10, 20, 10);
+scene.add(dirLight);
+
+// ── Grid ──
+const grid = new THREE.GridHelper(40, 40, 0x222233, 0x111122);
+scene.add(grid);
+
+// ── Axis ──
+const axisLen = 2;
+const axisRed   = new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0,0,0), new THREE.Vector3(axisLen,0,0)]), new THREE.LineBasicMaterial({color:0xff3333}));
+const axisGreen = new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0,0,0), new THREE.Vector3(0,axisLen,0)]), new THREE.LineBasicMaterial({color:0x33ff33}));
+const axisBlue  = new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0,0,0), new THREE.Vector3(0,0,axisLen)]), new THREE.LineBasicMaterial({color:0x3366ff}));
+scene.add(axisRed, axisGreen, axisBlue);
+
+// ── Trajectory ──
+const trajPoints = [];
+const trajGeom = new THREE.BufferGeometry();
+const trajMat = new THREE.PointsMaterial({ color: 0x44ff88, size: 0.08 });
+const trajCloud = new THREE.Points(trajGeom, trajMat);
+scene.add(trajCloud);
+
+const trajLineGeom = new THREE.BufferGeometry();
+const trajLine = new THREE.Line(trajLineGeom, new THREE.LineBasicMaterial({ color: 0x44ff88, transparent:true, opacity:0.4 }));
+scene.add(trajLine);
+
+// ── Point Cloud ──
+const pcGeom = new THREE.BufferGeometry();
+const pcMat = new THREE.PointsMaterial({ color: 0xffaa44, size: 0.04, sizeAttenuation: true });
+const pcCloud = new THREE.Points(pcGeom, pcMat);
+scene.add(pcCloud);
+
+// ── Robot Model (simple box) ──
+const robotGeom = new THREE.BoxGeometry(0.3, 0.2, 0.4);
+const robotMat = new THREE.MeshStandardMaterial({ color: 0x44aaff, metalness: 0.3, roughness: 0.6 });
+const robotMesh = new THREE.Mesh(robotGeom, robotMat);
+scene.add(robotMesh);
+const robotArrow = new THREE.ArrowHelper(new THREE.Vector3(1,0,0), new THREE.Vector3(0,0,0), 0.6, 0x44aaff);
+scene.add(robotArrow);
+
+// ── Render Loop ──
+function animate() {
+  requestAnimationFrame(animate);
+  controls.update();
+  renderer.render(scene, camera);
+}
+animate();
+
+// ── HUD elements ──
+const statusEl = document.getElementById('status');
+const trajCountEl = document.getElementById('traj-count');
+const pcCountEl = document.getElementById('pc-count');
+
+// ── ROS Bridge ──
+const wsUrl = `ws://${window.location.host}/ws`;
+let rosConnected = false;
+
+function connect() {
+  const ws = new WebSocket(wsUrl);
+  
+  ws.onopen = () => {
+    rosConnected = true;
+    statusEl.textContent = '● 已连接';
+    statusEl.className = 'green';
+    
+    // Subscribe to odometry
+    ws.send(JSON.stringify({
+      op: 'subscribe', topic: '/dlio/odom_node/odom', type: 'nav_msgs/msg/Odometry'
+    }));
+    // Subscribe to deskewed point cloud
+    ws.send(JSON.stringify({
+      op: 'subscribe', topic: '/dlio/odom_node/pointcloud/deskewed', type: 'sensor_msgs/msg/PointCloud2'
+    }));
+  };
+
+  ws.onmessage = (event) => {
+    const msg = JSON.parse(event.data);
+    if (msg.op === 'publish') {
+      if (msg.topic === '/dlio/odom_node/odom') {
+        handleOdometry(msg.msg);
+      } else if (msg.topic === '/dlio/odom_node/pointcloud/deskewed') {
+        handlePointCloud(msg.msg);
+      }
+    }
+  };
+
+  ws.onclose = () => {
+    rosConnected = false;
+    statusEl.textContent = '● 断开，3秒后重连...';
+    statusEl.className = 'red';
+    setTimeout(connect, 3000);
+  };
+
+  ws.onerror = () => {
+    statusEl.textContent = '● 连接失败';
+    statusEl.className = 'red';
+  };
+}
+
+// ── Coordinate conversion: ROS (X-fwd Y-left Z-up) → three.js (X-right Y-up Z-fwd) ──
+function rosToThree(x, y, z) {
+  return new THREE.Vector3(x, z, -y);
+}
+
+// ── Odometry Handler ──
+function handleOdometry(msg) {
+  const p = msg.pose.pose.position;
+  const pos = rosToThree(p.x, p.y, p.z);
+  trajPoints.push(pos);
+  
+  // Limit trajectory size
+  if (trajPoints.length > 10000) trajPoints.shift();
+  
+  trajGeom.setFromPoints(trajPoints);
+  trajLineGeom.setFromPoints(trajPoints);
+  trajCountEl.textContent = trajPoints.length;
+  
+  // Move robot model
+  const q = msg.pose.pose.orientation;
+  // ROS quaternion (w,x,y,z) with ROS axes → rotate to three.js frame
+  const rosQ = new THREE.Quaternion(q.x, q.y, q.z, q.w);
+  // Rotate from ROS frame to three.js: X→X, Y→-Z, Z→Y
+  const rot = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1,0,0), -Math.PI/2);
+  robotMesh.position.copy(pos);
+  robotMesh.quaternion.copy(rot).multiply(rosQ);
+  robotArrow.position.copy(pos);
+  const dir = new THREE.Vector3(1, 0, 0).applyQuaternion(robotMesh.quaternion);
+  robotArrow.setDirection(dir);
+}
+
+// ── Point Cloud Handler ──
+function handlePointCloud(msg) {
+  if (!msg.data || msg.width === 0) return;
+  
+  // Decode base64 → binary
+  const raw = atob(msg.data);
+  const bytes = new Uint8Array(raw.length);
+  for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
+  
+  // Find x,y,z field offsets
+  let ox = 0, oy = 0, oz = 0;
+  for (const f of msg.fields) {
+    if (f.name === 'x') ox = f.offset;
+    if (f.name === 'y') oy = f.offset;
+    if (f.name === 'z') oz = f.offset;
+  }
+  
+  const view = new DataView(bytes.buffer);
+  const pointStep = msg.point_step;
+  const points = [];
+  
+  for (let i = 0; i < msg.width; i++) {
+    const off = i * pointStep;
+    const rx = view.getFloat32(off + ox, true);
+    const ry = view.getFloat32(off + oy, true);
+    const rz = view.getFloat32(off + oz, true);
+    points.push(rosToThree(rx, ry, rz));
+  }
+  
+  pcGeom.setFromPoints(points);
+  pcCountEl.textContent = points.length;
+}
+
+// ── Window Resize ──
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// ── Start ──
+connect();
+</script>
+</body>
+</html>

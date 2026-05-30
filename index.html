@@ -125,11 +125,21 @@ loader.load(
   (gltf) => {
     robotModel = gltf.scene;
     robotRoot.add(robotModel);
+
+    // Extract joint nodes and apply rear-leg 180° Y flip
+    const rearFlip = new THREE.Quaternion().setFromAxisAngle(
+      new THREE.Vector3(0, 1, 0), Math.PI
+    );
     robotModel.traverse((node) => {
       if (JOINT_DEFS[node.name]) {
         jointNodes[node.name] = node;
         node.userData.restPosition = node.position.clone();
-        node.userData.restQuaternion = node.quaternion.clone();
+        let q = node.quaternion.clone();
+        // Rear legs (RR/RL): flip mesh 180° around Y — same kinematics, correct visual
+        if (node.name.startsWith('RR_') || node.name.startsWith('RL_')) {
+          q.premultiply(rearFlip);
+        }
+        node.userData.restQuaternion = q;
       }
       if (node.name === 'base') baseNode = node;
     });
